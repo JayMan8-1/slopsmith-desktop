@@ -389,6 +389,12 @@ package_application() {
     # resources/bin/rscli/ and overwrites the codesigned versions
     # produced by sign-macos-binaries.sh, so notarization sees unsigned
     # nested binaries and rejects the bundle.
+    #
+    # `--publish never` is required: on a tag push electron-builder
+    # defaults to auto-publishing to GitHub Releases and then errors out
+    # without GH_TOKEN. The workflow has a dedicated `release` job that
+    # publishes via softprops/action-gh-release after artifact upload —
+    # the build job just needs to produce artifacts, not publish them.
     local builder_platform
     case "$PLATFORM" in
         linux)   builder_platform="--linux" ;;
@@ -399,7 +405,7 @@ package_application() {
             exit 1
             ;;
     esac
-    npx electron-builder "$builder_platform"
+    npx electron-builder "$builder_platform" --publish never
     echo_summary "Application packaged"
     echo ""
 }
