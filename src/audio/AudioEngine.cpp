@@ -182,25 +182,50 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
         }
     }
 
-    // Initialize if no device type set yet
+    // Initialize if no device type set yet.
+    //
+    // Linux ordering matters: JUCE typically lists JACK first whenever
+    // libjack is installed, even if jackd isn't actually running. Picking
+    // JACK in that case makes setCurrentAudioDeviceType block trying to
+    // reach a server that doesn't exist. Most home users run PulseAudio /
+    // PipeWire over ALSA, so prefer ALSA by default and let pro users
+    // who actually run JACK switch in the audio settings UI.
     if (deviceManager.getCurrentDeviceTypeObject() == nullptr)
     {
-        for (auto* type : deviceManager.getAvailableDeviceTypes())
-        {
-            auto typeName = type->getTypeName();
 #if JUCE_LINUX
-            if (typeName == "JACK" || typeName == "ALSA")
+        const juce::StringArray preferredOrder { "ALSA", "JACK" };
 #elif JUCE_MAC
-            if (typeName == "CoreAudio")
+        const juce::StringArray preferredOrder { "CoreAudio" };
 #elif JUCE_WINDOWS
-            if (typeName == "ASIO" || typeName == "Windows Audio")
+        const juce::StringArray preferredOrder { "Windows Audio", "ASIO" };
 #else
-            if (true)
+        const juce::StringArray preferredOrder;
 #endif
+
+        const auto& available = deviceManager.getAvailableDeviceTypes();
+        bool selected = false;
+
+        if (!preferredOrder.isEmpty())
+        {
+            for (const auto& want : preferredOrder)
             {
-                deviceManager.setCurrentAudioDeviceType(typeName, true);
-                break;
+                for (auto* type : available)
+                {
+                    if (type->getTypeName() == want)
+                    {
+                        deviceManager.setCurrentAudioDeviceType(want, true);
+                        selected = true;
+                        break;
+                    }
+                }
+                if (selected) break;
             }
+        }
+
+        if (!selected && !available.isEmpty())
+        {
+            // Fallback: take whatever JUCE listed first.
+            deviceManager.setCurrentAudioDeviceType(available.getFirst()->getTypeName(), true);
         }
     }
 
