@@ -128,6 +128,11 @@ export async function startPython(): Promise<void> {
         return;
     }
 
+    // Reset the readiness flag — this matters on restarts (`restartPython`),
+    // otherwise waitForPython would short-circuit on a flag set by the
+    // previous spawn and probe a server that hasn't actually started yet.
+    serverReady = false;
+
     serverPort = await findPort(18000);
     const pythonPath = findPythonExecutable();
     const configDir = getConfigDir();
@@ -241,26 +246,40 @@ export async function startPython(): Promise<void> {
 }
 
 export async function waitForPython(): Promise<number> {
-    // Poll the server until it responds. Generous total budget — with
-    // ~36 bundled plugins (some pulling in whisper / NAM / torch) the
-    // FastAPI lifespan startup takes well over a minute on first run,
-    // and the previous 60-s ceiling was rejecting healthy launches.
+    // Wait for the python child process we just spawned to be actually
+    // ready to serve. Two signals are required, in order:
+    //
+    //   1. The OUR-process stderr handler flips `serverReady` to true
+    //      when it sees uvicorn print "Application startup complete"
+    //      or "Uvicorn running on". This is the authoritative readiness
+    //      signal — it comes from the child process we just spawned, so
+    //      it can't be fooled by a zombie python from a prior crashed
+    //      launch still listening on a different port.
+    //
+    //   2. Once that flag flips, a single HTTP probe to /api/plugins
+    //      confirms the listener is reachable on the port we picked.
+    //      Belt-and-suspenders against any race between the stderr
+    //      message and the socket actually accepting connections.
+    //
+    // Generous total budget — with ~36 bundled plugins (whisper / NAM /
+    // torch get imported), first-run lifespan startup easily exceeds
+    // one minute on a cold cache.
     const maxAttempts = 600; // 5 minutes
     const intervalMs = 500;
     for (let i = 0; i < maxAttempts; i++) {
-        try {
+        if (serverReady) {
             const ok = await new Promise<boolean>((resolve) => {
                 const req = http.get(`http://127.0.0.1:${serverPort}/api/plugins`, (res) => {
-                    resolve(res.statusCode === 200);
+                    resolve((res.statusCode || 0) >= 200 && (res.statusCode || 0) < 500);
                 });
                 req.on('error', () => resolve(false));
-                req.setTimeout(500, () => { req.destroy(); resolve(false); });
+                req.setTimeout(2000, () => { req.destroy(); resolve(false); });
             });
-            if (ok) {
-                serverReady = true;
-                return serverPort;
-            }
-        } catch { /* retry */ }
+            if (ok) return serverPort;
+            // serverReady was set but HTTP probe failed — fall through
+            // and retry (lifespan-complete may briefly precede socket
+            // accept on slow machines).
+        }
 
         // Periodic progress so a long startup doesn't look like a freeze.
         // Logged every 10 s so the dev console / launcher log shows life.

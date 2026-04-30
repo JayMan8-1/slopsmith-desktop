@@ -55,19 +55,44 @@ function createWindow(port: number): void {
     // Small delay to ensure server is fully accepting connections, then load
     setTimeout(() => mainWindow?.loadURL(serverUrl), 500);
 
-    // Retry loading if server wasn't ready yet (single retry to avoid double-load issues)
-    let retried = false;
-    mainWindow.webContents.on('did-fail-load', (_event, errorCode, _errorDesc) => {
-        if (!retried && (errorCode === -102 || errorCode === -6)) {
-            retried = true;
-            setTimeout(() => {
-                mainWindow?.loadURL(serverUrl);
-            }, 1500);
+    // Retry loading if the server wasn't reachable yet. Previously this
+    // retried just once, which left the window stuck on Chromium's
+    // built-in error page when the python lifespan startup happened to
+    // run long (or a zombie was holding the candidate port). Retry up
+    // to maxRetries × intervalMs (~30 s total) with a fixed cadence —
+    // long enough to ride out cold-cache plugin imports without giving
+    // up. Only retry on the network-side error codes that indicate
+    // "server not up yet"; don't retry on 404/etc. that mean the server
+    // is up but served something we can't load.
+    //   -102 = ERR_CONNECTION_REFUSED
+    //   -6   = ERR_FILE_NOT_FOUND   (rare; shows up on transient races)
+    //   -118 = ERR_CONNECTION_TIMED_OUT
+    //   -2   = ERR_FAILED          (catch-all for transient socket errors)
+    const retryableErrors = new Set([-102, -6, -118, -2]);
+    const maxRetries = 20;
+    const retryIntervalMs = 1500;
+    let retryCount = 0;
+    mainWindow.webContents.on('did-fail-load', (_event, errorCode) => {
+        if (!retryableErrors.has(errorCode)) return;
+        if (retryCount >= maxRetries) {
+            console.log(`[main] gave up loading ${serverUrl} after ${maxRetries} retries (last errorCode=${errorCode})`);
+            return;
         }
+        retryCount += 1;
+        setTimeout(() => {
+            if (!mainWindow) return;
+            mainWindow.loadURL(serverUrl);
+        }, retryIntervalMs);
     });
 
-    // Inject mutable sync offset after page loads (default 200ms, overridden by settings)
+    // Inject mutable sync offset after page loads (default 200ms, overridden by settings).
+    // Gate on the actual server URL — Chromium fires did-finish-load on its
+    // built-in error pages too, and those have a null origin, so reading
+    // localStorage from them throws SecurityError. Only inject when we
+    // actually loaded the http://127.0.0.1 origin.
     mainWindow.webContents.on('did-finish-load', () => {
+        const url = mainWindow?.webContents.getURL() || '';
+        if (!url.startsWith('http://127.0.0.1:')) return;
         mainWindow?.webContents.executeJavaScript(`
             window._slopsmithSyncOffset = parseFloat(localStorage.getItem('slopsmith-sync-offset') || '0.2');
         `).catch(() => {});
