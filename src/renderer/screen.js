@@ -763,6 +763,27 @@
     }
     setupPathPickers();
 
+    async function setupPsarcPlatformFilter() {
+        const sel = document.getElementById('ae-psarc-platform');
+        if (!sel) return;
+        try {
+            const r = await fetch('/api/settings');
+            if (r.ok) {
+                const s = await r.json();
+                sel.value = s.psarc_platform || 'both';
+            }
+        } catch {}
+        sel.addEventListener('change', async () => {
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ psarc_platform: sel.value }),
+            });
+            await fetch('/api/rescan', { method: 'POST' });
+        });
+    }
+    setupPsarcPlatformFilter();
+
     // ── Preset Management ──────────────────────────────────────────────────────
     function getPresets() {
         try {

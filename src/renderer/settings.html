@@ -42,6 +42,15 @@
         </div>
     </div>
     <div>
+        <label class="block text-xs text-slate-400 mb-1">PSARC Platform Filter</label>
+        <select id="ae-psarc-platform" class="bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm w-full">
+            <option value="both">All files (PC + Mac)</option>
+            <option value="pc">PC only (_p.psarc)</option>
+            <option value="mac">Mac only (_m.psarc)</option>
+        </select>
+        <p class="text-xs text-slate-500 mt-1">Removes duplicate entries when your DLC folder contains both _p.psarc (PC) and _m.psarc (Mac) variants of the same song.</p>
+    </div>
+    <div>
         <label class="block text-xs text-slate-400 mb-1">NAM Models Folder</label>
         <div class="flex gap-2">
             <input type="text" id="ae-nam-path" class="flex-1 bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm">
