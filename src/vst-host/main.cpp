@@ -1134,8 +1134,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         for (int i = 1; i + 1 < argc; ++i)
         {
             const juce::String key(argv[i]);
-            if      (key == "--scan-plugin") scanPlugin = juce::String(argv[i + 1]);
-            else if (key == "--scan-out")    scanOut    = juce::String(argv[i + 1]);
+            // ++i to consume the value so it isn't re-examined as a key on the
+            // next iteration (a plugin path is unlikely to collide with a flag
+            // name, but skipping it keeps the parse unambiguous).
+            if (key == "--scan-plugin") { scanPlugin = juce::String(argv[++i]); }
+            else if (key == "--scan-out") { scanOut = juce::String(argv[++i]); }
         }
         if (scanPlugin.isNotEmpty() || scanOut.isNotEmpty())
         {
