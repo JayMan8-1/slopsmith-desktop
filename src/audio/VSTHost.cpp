@@ -173,11 +173,17 @@ void VSTHost::scanDirectories(const juce::StringArray& directories, ScanProgress
                 juce::String reason;
                 const juce::String xml = scanPluginOutOfProcess(
                     hostExe, file, kScanTimeoutMs, reason);
-                if (xml.isNotEmpty())
-                    addPluginsFromXml(xml);
+                if (xml.isNotEmpty() && addPluginsFromXml(xml))
+                {
+                    // probe succeeded — descriptors merged
+                }
                 else
+                {
+                    if (reason.isEmpty())
+                        reason = "scan host produced unparseable output";
                     juce::Logger::writeToLog("VST scan: skipped " + file
                                              + " — " + reason);
+                }
 
                 ++scannedCount;
                 const float progress = totalFiles > 0
@@ -242,10 +248,11 @@ juce::String VSTHost::scanPluginFileToXml(const juce::String& path)
     return root.toString();
 }
 
-void VSTHost::addPluginsFromXml(const juce::String& xml)
+bool VSTHost::addPluginsFromXml(const juce::String& xml)
 {
     const auto parsed = juce::parseXML(xml);
-    if (parsed == nullptr) return;
+    if (parsed == nullptr || ! parsed->hasTagName("PLUGINS"))
+        return false;
 
     const juce::ScopedLock sl(listLock);
     for (auto* child : parsed->getChildIterator())
@@ -254,6 +261,7 @@ void VSTHost::addPluginsFromXml(const juce::String& xml)
         if (desc.loadFromXml(*child))
             knownPlugins.addType(desc);
     }
+    return true;
 }
 
 // ── Plugin Access ─────────────────────────────────────────────────────────────
