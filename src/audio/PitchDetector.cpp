@@ -32,27 +32,87 @@ PitchDetector::~PitchDetector()
     stop();
 }
 
+// Designs one 2nd-order RBJ-cookbook low-pass biquad.  The cascade in
+// prepare() is Butterworth only because of the section Q values it passes.
+void PitchDetector::designLowpass(Biquad& bq, double cutoffHz, double sampleRate, double q)
+{
+    const double w0    = juce::MathConstants<double>::twoPi * cutoffHz / sampleRate;
+    const double cosw0 = std::cos(w0);
+    const double alpha = std::sin(w0) / (2.0 * q);
+
+    const double a0 =  1.0 + alpha;
+    bq.b0 = ((1.0 - cosw0) * 0.5) / a0;
+    bq.b1 =  (1.0 - cosw0)        / a0;
+    bq.b2 = ((1.0 - cosw0) * 0.5) / a0;
+    bq.a1 = (-2.0 * cosw0)        / a0;
+    bq.a2 =  (1.0 - alpha)        / a0;
+    bq.reset();
+}
+
 void PitchDetector::prepare(double sampleRate, int /*blockSize*/)
 {
-    currentSampleRate = sampleRate;
-    analysisWritePos = 0;
-    std::fill(analysisBuffer.begin(), analysisBuffer.end(), 0.0f);
+    // prepare() runs on the audio-device setup path (audioDeviceAboutToStart),
+    // i.e. while the audio callback is stopped — pushSamples() is not running
+    // concurrently, so the FIFO and analysis buffer can be reconfigured safely.
+    // stop() additionally joins the detection thread before any shared state is
+    // touched below; it must not be called while the audio callback is live.
+    stop();
 
-    if (!running.load())
-    {
-        running.store(true);
-        thread = std::make_unique<PitchDetectionThread>([this]() { detectionThread(); });
-        thread->startThread(juce::Thread::Priority::normal);
-    }
+    // Decimate the device stream down to <= ~8 kHz for detection so YIN's
+    // O(N^2) difference function stays bounded regardless of device rate.
+    // ceil() keeps internalRate at or below targetInternalRate (floor() could
+    // leave it higher, e.g. ~8.8 kHz at 44.1 kHz, inflating the YIN cost).
+    decimationFactor = std::max(1, (int)std::ceil(sampleRate / targetInternalRate));
+    internalRate     = sampleRate / decimationFactor;
+    decimPhase       = 0;
+
+    // Window spans >2 periods of the lowest note of interest (25 Hz) at the
+    // internal rate, so YIN can resolve B0 / drop tunings (~640 samples).
+    analysisSize = 2 * ((int)std::ceil(internalRate / 25.0) + 1);
+    analysisBuffer.assign((size_t)analysisSize, 0.0f);
+    analysisWritePos = 0;
+    analysisSamplesPrimed = 0;
+
+    // Pre-size the detection-thread scratch buffers so the detection loop
+    // never allocates.  yinBuffer needs analysisSize/2 entries (halfLen),
+    // the upper bound on tauMax + 1.
+    windowBuffer.assign((size_t)analysisSize, 0.0f);
+    yinBuffer.assign((size_t)(analysisSize / 2), 0.0f);
+
+    // Anti-aliasing low-pass below the post-decimation Nyquist (internalRate/2),
+    // run at the device rate before decimation.  Two cascaded RBJ low-pass
+    // biquads given the standard Butterworth section Q values, which makes the
+    // overall 4th-order response Butterworth.  The cutoff sits near the top
+    // of the detectable range (~2 kHz) when the internal rate allows; otherwise
+    // it is capped at internalRate*0.45 to stay below the Nyquist margin.
+    const double cutoff = std::min(2200.0, internalRate * 0.45);
+    designLowpass(aaFilter[0], cutoff, sampleRate, 0.54119610);
+    designLowpass(aaFilter[1], cutoff, sampleRate, 1.30656296);
+
+    // Drop any samples queued before this (re)configure so the restarted
+    // detector never analyses stale audio from the previous run.
+    fifo.reset();
+
+    // Clear the last published detection so getLatestDetection() never reports
+    // a stale note from the previous run before the first new frame arrives.
+    detectedFreq.store(-1.0f);
+    detectedConfidence.store(0.0f);
+    detectedMidi.store(-1);
+    detectedCents.store(0.0f);
+
+    thread = std::make_unique<PitchDetectionThread>([this]() { detectionThread(); });
+    thread->startThread(juce::Thread::Priority::normal);
 }
 
 void PitchDetector::stop()
 {
-    running.store(false);
     if (thread)
     {
-        thread->signalThreadShouldExit();
-        thread->waitForThreadToExit(1000);
+        // Wait unconditionally for the thread to exit before destroying it.
+        // The detection loop sleeps 10 ms between passes, so this typically
+        // returns within ~10 ms plus one bounded YIN pass; waiting without a
+        // timeout avoids racing into a use-after-free on a still-running thread.
+        thread->stopThread(-1);
         thread.reset();
     }
 }
@@ -82,31 +142,50 @@ PitchDetector::Detection PitchDetector::getLatestDetection() const
 
 void PitchDetector::detectionThread()
 {
-    // Read available samples from FIFO into analysis buffer
+    // Read all available device-rate samples from the FIFO.
     auto scope = fifo.read(fifo.getNumReady());
-
-    for (int i = 0; i < scope.blockSize1; ++i)
-    {
-        analysisBuffer[(size_t)analysisWritePos] = fifoBuffer[(size_t)(scope.startIndex1 + i)];
-        analysisWritePos = (analysisWritePos + 1) % analysisSize;
-    }
-
-    for (int i = 0; i < scope.blockSize2; ++i)
-    {
-        analysisBuffer[(size_t)analysisWritePos] = fifoBuffer[(size_t)(scope.startIndex2 + i)];
-        analysisWritePos = (analysisWritePos + 1) % analysisSize;
-    }
 
     if (scope.blockSize1 + scope.blockSize2 == 0)
         return; // no new data
 
-    // Run YIN on the analysis buffer (arranged as a contiguous window)
-    // Rearrange: put oldest samples first
-    std::vector<float> window(analysisSize);
-    for (int i = 0; i < analysisSize; ++i)
-        window[(size_t)i] = analysisBuffer[(size_t)((analysisWritePos + i) % analysisSize)];
+    // Anti-alias filter at the device rate, then decimate into the
+    // internal-rate analysis buffer (keep every decimationFactor-th sample).
+    int decimatedWritten = 0;
+    auto consume = [this, &decimatedWritten](float raw)
+    {
+        const float filtered = aaFilter[1].process(aaFilter[0].process(raw));
+        if (++decimPhase >= decimationFactor)
+        {
+            decimPhase = 0;
+            analysisBuffer[(size_t)analysisWritePos] = filtered;
+            analysisWritePos = (analysisWritePos + 1) % analysisSize;
+            if (analysisSamplesPrimed < analysisSize)
+                ++analysisSamplesPrimed;
+            ++decimatedWritten;
+        }
+    };
 
-    float freq = yinDetect(window.data(), analysisSize, (float)currentSampleRate);
+    for (int i = 0; i < scope.blockSize1; ++i)
+        consume(fifoBuffer[(size_t)(scope.startIndex1 + i)]);
+
+    for (int i = 0; i < scope.blockSize2; ++i)
+        consume(fifoBuffer[(size_t)(scope.startIndex2 + i)]);
+
+    // Skip the YIN pass when the window is not worth analysing:
+    //  - decimatedWritten == 0: this tick produced no decimated sample, so the
+    //    window is unchanged — avoid re-publishing an identical result.
+    //  - not yet primed: fewer than analysisSize decimated samples have been
+    //    written since prepare(), so the window still holds startup silence,
+    //    which could otherwise yield spurious notes.
+    if (decimatedWritten == 0 || analysisSamplesPrimed < analysisSize)
+        return;
+
+    // Rearrange the ring buffer into the contiguous window scratch buffer
+    // (oldest sample first) and run YIN on it.
+    for (int i = 0; i < analysisSize; ++i)
+        windowBuffer[(size_t)i] = analysisBuffer[(size_t)((analysisWritePos + i) % analysisSize)];
+
+    float freq = yinDetect(windowBuffer.data(), analysisSize, (float)internalRate);
 
     if (freq > 0.0f)
     {
@@ -132,18 +211,30 @@ void PitchDetector::detectionThread()
 // ── YIN Algorithm ─────────────────────────────────────────────────────────────
 // Ported from Slopsmith's note_detect plugin JavaScript implementation.
 
-float PitchDetector::yinDetect(const float* buffer, int length, float sampleRate) const
+float PitchDetector::yinDetect(const float* buffer, int length, float sampleRate)
 {
     const float threshold = 0.15f;
     const int halfLen = length / 2;
 
-    std::vector<float> yinBuffer((size_t)halfLen);
+    // Restrict tau to the frequency range we care about.  This avoids scanning
+    // taus that correspond to undetectable or out-of-range pitches and keeps
+    // computation proportional to the useful search window.
+    //   tauMin → smallest lag scanned (highest pitch of interest, 2000 Hz);
+    //            floor() so the integer lag just below sampleRate/2000 is
+    //            still considered, keeping pitches up to ~2000 Hz in range.
+    //   tauMax → lowest pitch of interest (25 Hz covers B0/drop tunings)
+    //            capped at halfLen-1, which is the true YIN limit.
+    const int tauMin = std::max(2, (int)std::floor(sampleRate / 2000.0f));
+    const int tauMax = std::min(halfLen - 1, (int)std::ceil(sampleRate / 25.0f));
 
-    // Difference function
+    // yinBuffer is the pre-sized scratch member (>= halfLen entries, so it
+    // always covers indices [0, tauMax]); only [0, tauMax] are written/read.
+
+    // Difference function — compute only up to tauMax
     float runningSum = 0.0f;
     yinBuffer[0] = 1.0f;
 
-    for (int tau = 1; tau < halfLen; ++tau)
+    for (int tau = 1; tau <= tauMax; ++tau)
     {
         float sum = 0.0f;
         for (int i = 0; i < halfLen; ++i)
@@ -159,25 +250,30 @@ float PitchDetector::yinDetect(const float* buffer, int length, float sampleRate
             yinBuffer[(size_t)tau] *= (float)tau / runningSum;
     }
 
-    // Absolute threshold
-    int tau = 2;
-    while (tau < halfLen)
+    // Silent or DC-constant frame: all difference values are zero, every
+    // CMNDF entry stays 0, and the threshold test (0 < 0.15) would accept the
+    // very first tau — producing a spurious pitch.  Bail out early.
+    if (runningSum < 1e-10f) return -1.0f;
+
+    // Absolute threshold — search only within the detectable pitch range
+    int tau = tauMin;
+    while (tau <= tauMax)
     {
         if (yinBuffer[(size_t)tau] < threshold)
         {
-            while (tau + 1 < halfLen && yinBuffer[(size_t)(tau + 1)] < yinBuffer[(size_t)tau])
+            while (tau + 1 <= tauMax && yinBuffer[(size_t)(tau + 1)] < yinBuffer[(size_t)tau])
                 ++tau;
             break;
         }
         ++tau;
     }
 
-    if (tau == halfLen) return -1.0f; // no pitch detected
+    if (tau > tauMax) return -1.0f; // no pitch detected
 
     // Parabolic interpolation for sub-sample accuracy
     float s0 = tau > 0 ? yinBuffer[(size_t)(tau - 1)] : yinBuffer[(size_t)tau];
     float s1 = yinBuffer[(size_t)tau];
-    float s2 = (tau + 1 < halfLen) ? yinBuffer[(size_t)(tau + 1)] : yinBuffer[(size_t)tau];
+    float s2 = (tau + 1 <= tauMax) ? yinBuffer[(size_t)(tau + 1)] : yinBuffer[(size_t)tau];
 
     float denom = 2.0f * (s0 - 2.0f * s1 + s2);
     float betterTau = (std::abs(denom) > 1e-9f)
@@ -186,8 +282,13 @@ float PitchDetector::yinDetect(const float* buffer, int length, float sampleRate
 
     float freq = sampleRate / betterTau;
 
-    // Sanity check: guitar range is ~80 Hz (E2) to ~1320 Hz (E6)
-    if (freq < 50.0f || freq > 2000.0f) return -1.0f;
+    // Sanity check: guitar range is ~80 Hz (E2) to ~1320 Hz (E6);
+    // bass is ~41 Hz (E1) to ~330 Hz (E4), with some extended-range basses
+    // reaching ~31 Hz (B0). Detection runs on a decimated ~8 kHz internal
+    // stream whose window spans >2 periods of 25 Hz, so a 25 Hz floor is
+    // resolvable; it covers extended-range bass tunings (B0 ~31 Hz, drop-A
+    // ~27.5 Hz) and rejects sub-bass artefacts.
+    if (freq < 25.0f || freq > 2000.0f) return -1.0f;
 
     return freq;
 }
