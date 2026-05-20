@@ -27,6 +27,21 @@ const vstSlotPaths = new Map<number, string>();
 // createEditor that returned null) are caught by the periodic watcher.
 const openEditors = new Map<number, string>();
 
+// Slots whose isPluginEditorOpen has returned true at least once. The
+// watcher only prunes confirmed entries that have flipped back to
+// not-open — without this, a slow createEditor (audio:openPluginEditor
+// returns before createEditor finishes on the JUCE message thread) could
+// be pruned by the very next watcher tick.
+const confirmedEditors = new Set<number>();
+
+// Per-slot timestamp of when the open IPC was acknowledged. Used to bound
+// the "pending" state (in openEditors but not yet confirmed): if createEditor
+// never produces a window (e.g. it silently returned null in the async
+// lambda), the pending entry is dropped after PENDING_TIMEOUT_MS so the
+// sentinel doesn't stay armed forever.
+const openedAt = new Map<number, number>();
+const PENDING_TIMEOUT_MS = 30000;
+
 // Maximum time an entry stays in openEditors when the native addon doesn't
 // expose isPluginEditorOpen (older builds — version skew at dev time). After
 // this we give up and drop the entry, accepting a missed late-crash rather
@@ -113,24 +128,43 @@ export function initAudioBridge(): void {
             console.warn(`[audio] VST crash guard init failed: ${e.message}`);
         }
 
-        // Periodic editor-state watcher: drop any entry in openEditors whose
-        // window has vanished outside IPC — the OS title-bar X
-        // (PluginEditorWindow::closeButtonPressed) and async editor-creation
-        // failure (createEditor returned null inside the open lambda) both
-        // close a window without going through audio:closePluginEditor.
-        // Re-arms the sentinel for whatever's still open, or disarms if
-        // nothing is. Unref'd so it never holds the process open on its own.
+        // Periodic editor-state watcher: drop entries in openEditors whose
+        // window has vanished outside IPC (OS title-bar X close; async
+        // createEditor that returned null). To avoid pruning slow async
+        // creations, only prune entries that have been *confirmed* open at
+        // least once. Pending entries are bounded by PENDING_TIMEOUT_MS so
+        // a never-confirming open doesn't leave the sentinel armed forever.
+        // Unref'd so it never holds the process open on its own.
         const editorWatcher = setInterval(() => {
             if (openEditors.size === 0) return;
             if (typeof audio?.isPluginEditorOpen !== 'function') return;
+            const now = Date.now();
             let changed = false;
             for (const slotId of [...openEditors.keys()]) {
+                let isOpen = false;
                 try {
-                    if (!audio.isPluginEditorOpen(slotId)) {
-                        openEditors.delete(slotId);
-                        changed = true;
-                    }
-                } catch { /* best-effort */ }
+                    isOpen = !!audio.isPluginEditorOpen(slotId);
+                } catch { continue; }
+                if (isOpen) {
+                    confirmedEditors.add(slotId);
+                    continue;
+                }
+                if (confirmedEditors.has(slotId)) {
+                    // Was confirmed open, now closed — the user clicked the
+                    // native X (or some other off-IPC close).
+                    openEditors.delete(slotId);
+                    confirmedEditors.delete(slotId);
+                    openedAt.delete(slotId);
+                    changed = true;
+                    continue;
+                }
+                // Pending — give createEditor a generous window.
+                const t0 = openedAt.get(slotId) ?? now;
+                if (now - t0 > PENDING_TIMEOUT_MS) {
+                    openEditors.delete(slotId);
+                    openedAt.delete(slotId);
+                    changed = true;
+                }
             }
             if (changed) rearmSentinelForMostRecentEditor();
         }, 3000);
@@ -456,7 +490,10 @@ export function initAudioBridge(): void {
         vstSlotPaths.delete(slotId);
         // The slot is gone — any editor it had is destroyed. Drop it from
         // the open-editors map and rearm for whatever's still open.
-        if (openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
+        const wasOpen = openEditors.delete(slotId);
+        confirmedEditors.delete(slotId);
+        openedAt.delete(slotId);
+        if (wasOpen) rearmSentinelForMostRecentEditor();
     });
 
     ipcMain.handle('audio:moveProcessor', (_event, from: number, to: number) => {
@@ -473,6 +510,8 @@ export function initAudioBridge(): void {
         // Every editor window is destroyed — drop all open-editor entries
         // and disarm the sentinel.
         openEditors.clear();
+        confirmedEditors.clear();
+        openedAt.clear();
         rearmSentinelForMostRecentEditor();
     });
 
@@ -522,6 +561,7 @@ export function initAudioBridge(): void {
             // map and file in sync.
             openEditors.delete(slotId);
             openEditors.set(slotId, pluginPath);
+            openedAt.set(slotId, Date.now());
             rearmSentinelForMostRecentEditor();
             // Fallback for version skew: if the native addon predates the
             // isPluginEditorOpen export, the watcher can't prune entries on
@@ -550,7 +590,11 @@ export function initAudioBridge(): void {
         // editorWindows — in that case the editor may still appear moments
         // later, so keep tracking it; the periodic watcher will prune it
         // if it never does.
-        if (result && openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
+        if (result && openEditors.delete(slotId)) {
+            confirmedEditors.delete(slotId);
+            openedAt.delete(slotId);
+            rearmSentinelForMostRecentEditor();
+        }
         return result;
     });
 
