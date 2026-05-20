@@ -1509,21 +1509,47 @@ static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
 // editorWindows is owned by JUCE's message thread (mutations happen there
 // via callAsync), so the read is marshalled onto it rather than racing the
 // map / isVisible() call from the Node thread. The result is routed back
-// through a shared_ptr so a dispatchOnMessageThread timeout that releases
-// the caller's stack can't dangle the destination.
+// through a shared_ptr so a wait-timeout that releases the caller's stack
+// can't dangle the destination. On timeout the function THROWS rather than
+// returning false — false would be indistinguishable from a genuinely
+// closed editor, and the watcher would prune a still-open editor while
+// the message thread was just temporarily busy.
 static Napi::Value IsPluginEditorOpen(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     if (info.Length() < 1) return Napi::Boolean::New(env, false);
     int slotId = info[0].As<Napi::Number>().Int32Value();
+
+   #if JUCE_MAC
+    // Inline-execution model (see dispatchOnMessageThread): no background
+    // message thread, the read is naturally on the caller.
+    auto it = editorWindows.find(slotId);
+    const bool open = it != editorWindows.end()
+                      && it->second
+                      && it->second->isVisible();
+    return Napi::Boolean::New(env, open);
+   #else
     auto open = std::make_shared<bool>(false);
-    dispatchOnMessageThread([slotId, open]() {
+    auto done = std::make_shared<juce::WaitableEvent>();
+    juce::MessageManager::callAsync([slotId, open, done]() {
         auto it = editorWindows.find(slotId);
         *open = it != editorWindows.end()
                 && it->second
                 && it->second->isVisible();
+        done->signal();
     });
+    // Short bound: a responsive message thread answers in microseconds. A
+    // sustained stall means we can't truthfully answer — throw so the
+    // watcher's per-slot try/catch treats it as indeterminate and retries
+    // on the next tick rather than pruning a still-open editor.
+    if (! done->wait(1000))
+    {
+        Napi::Error::New(env, "isPluginEditorOpen: message thread did not respond")
+            .ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
     return Napi::Boolean::New(env, *open);
+   #endif
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
