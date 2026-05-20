@@ -41,6 +41,14 @@ const juce::StringArray kDefaultNeedsSandboxFilenames = {
     // crash by the renderer's VST crash guard and registered via
     // setCrashedPlugins().
     "Graphene",
+    // IK Multimedia AmpliTube — its WndProc dereferences a null `this` during
+    // DispatchMessageWorker (write at offset 0x331 with rcx=0, observed on
+    // AmpliTube 5 v5.10.8.0). The plugin's editor relies on main-thread
+    // affinity invariants the in-process JUCE message thread can't provide
+    // under Electron, so the crash typically fires well after editor-open —
+    // outside the editor sentinel's grace window. Pre-seed by filename prefix
+    // so every AmpliTube major loads sandboxed from the first launch.
+    "AmpliTube",
 };
 
 // Runtime crash blocklist: full plugin paths that crashed the app on a
