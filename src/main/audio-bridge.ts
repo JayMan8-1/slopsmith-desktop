@@ -27,6 +27,12 @@ const vstSlotPaths = new Map<number, string>();
 // createEditor that returned null) are caught by the periodic watcher.
 const openEditors = new Map<number, string>();
 
+// Maximum time an entry stays in openEditors when the native addon doesn't
+// expose isPluginEditorOpen (older builds — version skew at dev time). After
+// this we give up and drop the entry, accepting a missed late-crash rather
+// than leaving a sentinel armed forever.
+const EDITOR_GRACE_MS_NO_NATIVE_QUERY = 6000;
+
 // Refresh the on-disk sentinel from the current openEditors state. Arms for
 // the most-recent entry, or disarms when no editor is open.
 function rearmSentinelForMostRecentEditor(): void {
@@ -508,16 +514,30 @@ export function initAudioBridge(): void {
             openEditors.delete(slotId);
             openEditors.set(slotId, pluginPath);
             rearmSentinelForMostRecentEditor();
+            // Fallback for version skew: if the native addon predates the
+            // isPluginEditorOpen export, the watcher can't prune entries on
+            // its own, so bound the sentinel lifetime by a grace timer.
+            // Loses late-crash attribution for the AmpliTube-style pattern
+            // on downlevel addons, but avoids a sentinel armed forever.
+            if (typeof audio?.isPluginEditorOpen !== 'function') {
+                setTimeout(() => {
+                    if (openEditors.delete(slotId))
+                        rearmSentinelForMostRecentEditor();
+                }, EDITOR_GRACE_MS_NO_NATIVE_QUERY).unref();
+            }
         }
         return opened;
     });
 
     ipcMain.handle('audio:closePluginEditor', (_event, slotId: number) => {
         const result = audio?.closePluginEditor(slotId) ?? false;
-        // The editor window is gone. Drop this slot from the open-editors
-        // map and rearm for whatever's still open — closing one editor must
-        // not wipe a still-open editor on a different slot.
-        if (openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
+        // Only drop the entry when the native close actually closed an
+        // editor. A false return can happen if close is requested before
+        // the async createEditor callback inserted the window into
+        // editorWindows — in that case the editor may still appear moments
+        // later, so keep tracking it; the periodic watcher will prune it
+        // if it never does.
+        if (result && openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
         return result;
     });
 
