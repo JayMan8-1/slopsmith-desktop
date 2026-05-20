@@ -497,20 +497,29 @@ export function initAudioBridge(): void {
             const slot = (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId);
             if (slot && typeof slot.path === 'string') pluginPath = slot.path;
         }
+        // Pre-arm before the call to close the tiny window between
+        // audio.openPluginEditor returning and JS recording the slot: the
+        // queued createEditor on the JUCE message thread could fault almost
+        // immediately, and without an on-disk sentinel the crash would go
+        // un-attributed. On success/failure below, rearmSentinelForMostRecent-
+        // Editor overwrites this with the correct value derived from the
+        // openEditors map.
+        if (pluginPath) armEditorSentinel(pluginPath);
+
         let opened = false;
         try {
             opened = audio?.openPluginEditor(slotId) ?? false;
         } catch (e) {
-            // A thrown call is a clean failure, not a hard crash — and we
-            // haven't touched openEditors yet, so any other open editors
-            // keep their sentinel intact. Just propagate.
+            // Clean failure (a thrown call is not a hard crash). Revert the
+            // pre-arm to whatever the existing open editors should have
+            // armed for.
+            rearmSentinelForMostRecentEditor();
             throw e;
         }
-        // Only record on success. On a synchronous false (no editor / clean
-        // failure) the openEditors map is unchanged, so a still-open editor
-        // on another slot keeps its arm. On true: re-insert moves this slot
-        // to the most-recent position; the sentinel re-arms for it.
         if (opened && pluginPath) {
+            // Re-insert moves the slot to most-recent; rearm writes that
+            // (same) path to the sentinel. No-op on disk but keeps the
+            // map and file in sync.
             openEditors.delete(slotId);
             openEditors.set(slotId, pluginPath);
             rearmSentinelForMostRecentEditor();
@@ -525,6 +534,10 @@ export function initAudioBridge(): void {
                         rearmSentinelForMostRecentEditor();
                 }, EDITOR_GRACE_MS_NO_NATIVE_QUERY).unref();
             }
+        } else {
+            // !opened: revert the pre-arm so a previous still-open editor's
+            // attribution isn't overwritten by this slot's path.
+            rearmSentinelForMostRecentEditor();
         }
         return opened;
     });
