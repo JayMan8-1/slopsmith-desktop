@@ -9,10 +9,18 @@
 #include <cstdio>
 #include <cerrno>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 
 #include "AudioEngine.h"
 #include "VSTHost.h"
+
+// Forward declaration — defined alongside loadVstSandboxAware further down.
+// doShutdown (below) needs it to release any LoadVSTWorker / LoadPreset-
+// Worker blocked on a pending async load before the message thread stops.
+static void cancelAllPendingLoads();
 #include "VSTTrace.h"
 #include "NAMProcessor.h"
 #include "IRLoader.h"
@@ -20,8 +28,44 @@
 
 #include <juce_events/juce_events.h>
 
-static std::unique_ptr<AudioEngine> engine;
-static std::unique_ptr<VSTHost> vstHost;
+// engine / vstHost — shared_ptr (not unique_ptr) so worker threads can take
+// a stable snapshot that keeps the object alive for the duration of their
+// work, even if the message thread reassigns the global mid-operation. This
+// matters most for the async VST load: createPluginInstanceAsync's JUCE
+// continuation must not have VSTHost / its formatManager torn out from
+// under it mid-load.
+//
+// snapshotEngine() / snapshotVstHost() take the global under the matching
+// mutex and return a private copy. The only code permitted to touch the
+// bare `engine` / `vstHost` globals is the snapshot helpers below and the
+// mutex-guarded writes in Init / doShutdown — the message thread mutates
+// the globals there while worker threads and the napi handlers read them.
+//
+// Enforced rule: every *dereference* of engine / vstHost goes through a
+// local snapshot. A napi handler takes that snapshot at the top, null-
+// checks it, and uses only the local — either for the rest of its body,
+// or (for the handlers that hand off to an AsyncWorker — LoadVST,
+// LoadNAMModel, LoadIR, LoadPreset) purely as the availability guard
+// before queuing, with the worker re-snapshotting on its own thread.
+// Either way a concurrent doShutdown reset can never pull the object out
+// from under an in-flight dereference.
+static std::shared_ptr<AudioEngine> engine;
+static std::mutex engineMutex;
+
+static std::shared_ptr<AudioEngine> snapshotEngine()
+{
+    std::lock_guard<std::mutex> lock(engineMutex);
+    return engine;
+}
+
+static std::shared_ptr<VSTHost> vstHost;
+static std::mutex vstHostMutex;
+
+static std::shared_ptr<VSTHost> snapshotVstHost()
+{
+    std::lock_guard<std::mutex> lock(vstHostMutex);
+    return vstHost;
+}
 static std::thread juceMessageThread;
 static std::atomic<bool> juceRunning{false};
 static std::atomic<bool> alreadyShutDown{false};
@@ -116,10 +160,18 @@ static Napi::Value Init(const Napi::CallbackInfo& info)
 
     // Create engine on the JUCE message thread (or inline on macOS)
     dispatchOnMessageThread([]() {
-        engine = std::make_unique<AudioEngine>();
-        vstHost = std::make_unique<VSTHost>();
+        std::shared_ptr<AudioEngine> liveEngine;
+        {
+            std::lock_guard<std::mutex> lock(engineMutex);
+            engine = std::make_shared<AudioEngine>();
+            liveEngine = engine;
+        }
+        {
+            std::lock_guard<std::mutex> lock(vstHostMutex);
+            vstHost = std::make_shared<VSTHost>();
+        }
 
-        auto types = engine->getDeviceTypes();
+        auto types = liveEngine->getDeviceTypes();
         fprintf(stderr, "[audio-native] Init complete. Device types: %d\n", types.size());
         for (int i = 0; i < types.size(); ++i)
             fprintf(stderr, "[audio-native]   %s: %d inputs, %d outputs\n",
@@ -150,11 +202,26 @@ static void doShutdown()
     bool expected = false;
     if (!alreadyShutDown.compare_exchange_strong(expected, true)) return;
 
-    if (juceRunning.load() || engine || vstHost)
+    // Release any LoadVSTWorker / LoadPresetWorker currently blocked on a
+    // pending async load. Without this they'd wait forever on the
+    // WaitableEvent — the createPluginInstanceAsync callback can't fire
+    // once the message thread is gone. Forward-declared above; the
+    // implementation lives near loadVstSandboxAware.
+    cancelAllPendingLoads();
+
+    if (juceRunning.load() || snapshotEngine() || snapshotVstHost())
     {
         dispatchOnMessageThread([]() {
-            if (engine) { engine->stopAudio(); engine.reset(); }
-            vstHost.reset();
+            if (auto liveEngine = snapshotEngine())
+                liveEngine->stopAudio();
+            {
+                std::lock_guard<std::mutex> lock(engineMutex);
+                engine.reset();
+            }
+            {
+                std::lock_guard<std::mutex> lock(vstHostMutex);
+                vstHost.reset();
+            }
         });
     }
 
@@ -172,10 +239,11 @@ static Napi::Value Shutdown(const Napi::CallbackInfo& info)
 static Napi::Value GetDeviceTypes(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return env.Null();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
 
     // Device types are already scanned during init — safe to read from any thread
-    auto types = engine->getDeviceTypes();
+    auto types = liveEngine->getDeviceTypes();
 
     auto result = Napi::Array::New(env, types.size());
 
@@ -203,9 +271,10 @@ static Napi::Value GetDeviceTypes(const Napi::CallbackInfo& info)
 static Napi::Value GetSampleRates(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return Napi::Array::New(env);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return Napi::Array::New(env);
 
-    auto rates = engine->getSampleRates();
+    auto rates = liveEngine->getSampleRates();
     auto result = Napi::Array::New(env, rates.size());
     for (int i = 0; i < rates.size(); ++i)
         result.Set((uint32_t)i, rates[i]);
@@ -215,9 +284,10 @@ static Napi::Value GetSampleRates(const Napi::CallbackInfo& info)
 static Napi::Value GetBufferSizes(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return Napi::Array::New(env);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return Napi::Array::New(env);
 
-    auto sizes = engine->getBufferSizes();
+    auto sizes = liveEngine->getBufferSizes();
     auto result = Napi::Array::New(env, sizes.size());
     for (int i = 0; i < sizes.size(); ++i)
         result.Set((uint32_t)i, sizes[i]);
@@ -227,29 +297,44 @@ static Napi::Value GetBufferSizes(const Napi::CallbackInfo& info)
 static Napi::Value ProbeDeviceOptions(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
+    auto liveEngine = snapshotEngine();
     auto obj = Napi::Object::New(env);
     auto type = info.Length() > 0 && info[0].IsString() ? info[0].As<Napi::String>().Utf8Value() : "";
     auto input = info.Length() > 1 && info[1].IsString() ? info[1].As<Napi::String>().Utf8Value() : "";
     auto output = info.Length() > 2 && info[2].IsString() ? info[2].As<Napi::String>().Utf8Value() : "";
     auto ratesArray = Napi::Array::New(env);
     auto buffersArray = Napi::Array::New(env);
+    auto inputChannelsArray = Napi::Array::New(env);
+    auto outputChannelsArray = Napi::Array::New(env);
 
     obj.Set("type", type);
     obj.Set("input", input);
     obj.Set("output", output);
+    obj.Set("inputChannels", inputChannelsArray);
+    obj.Set("outputChannels", outputChannelsArray);
     obj.Set("sampleRates", ratesArray);
     obj.Set("bufferSizes", buffersArray);
-    if (!engine)
+    if (!liveEngine)
     {
         obj.Set("error", "Audio engine not initialized");
         return obj;
     }
 
-    auto options = engine->probeDeviceOptions(juce::String(type), juce::String(input), juce::String(output));
+    auto options = liveEngine->probeDeviceOptions(juce::String(type), juce::String(input), juce::String(output));
     obj.Set("type", options.type.toStdString());
     obj.Set("input", options.input.toStdString());
     obj.Set("output", options.output.toStdString());
     obj.Set("error", options.error.toStdString());
+
+    inputChannelsArray = Napi::Array::New(env, options.inputChannels.size());
+    for (int i = 0; i < options.inputChannels.size(); ++i)
+        inputChannelsArray.Set((uint32_t)i, options.inputChannels[i].toStdString());
+    obj.Set("inputChannels", inputChannelsArray);
+
+    outputChannelsArray = Napi::Array::New(env, options.outputChannels.size());
+    for (int i = 0; i < options.outputChannels.size(); ++i)
+        outputChannelsArray.Set((uint32_t)i, options.outputChannels[i].toStdString());
+    obj.Set("outputChannels", outputChannelsArray);
 
     ratesArray = Napi::Array::New(env, options.sampleRates.size());
     for (int i = 0; i < options.sampleRates.size(); ++i)
@@ -267,15 +352,16 @@ static Napi::Value ProbeDeviceOptions(const Napi::CallbackInfo& info)
 static Napi::Value GetCurrentDevice(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return env.Null();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
 
     auto obj = Napi::Object::New(env);
-    obj.Set("type", engine->getCurrentDeviceType().toStdString());
-    obj.Set("input", engine->getCurrentInputDevice().toStdString());
-    obj.Set("output", engine->getCurrentOutputDevice().toStdString());
-    obj.Set("sampleRate", engine->getCurrentSampleRate());
-    obj.Set("blockSize", engine->getCurrentBlockSize());
-    obj.Set("latencyMs", engine->getLatencyMs());
+    obj.Set("type", liveEngine->getCurrentDeviceType().toStdString());
+    obj.Set("input", liveEngine->getCurrentInputDevice().toStdString());
+    obj.Set("output", liveEngine->getCurrentOutputDevice().toStdString());
+    obj.Set("sampleRate", liveEngine->getCurrentSampleRate());
+    obj.Set("blockSize", liveEngine->getCurrentBlockSize());
+    obj.Set("latencyMs", liveEngine->getLatencyMs());
     return obj;
 }
 
@@ -284,17 +370,19 @@ static Napi::Value GetCurrentDevice(const Napi::CallbackInfo& info)
 static Napi::Value SetDeviceType(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1) return Napi::Boolean::New(env, false);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1) return Napi::Boolean::New(env, false);
 
     auto typeName = info[0].As<Napi::String>().Utf8Value();
-    bool result = engine->setDeviceType(juce::String(typeName));
+    bool result = liveEngine->setDeviceType(juce::String(typeName));
     return Napi::Boolean::New(env, result);
 }
 
 static Napi::Value SetDevice(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return Napi::Boolean::New(env, false);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return Napi::Boolean::New(env, false);
 
     auto input = info.Length() > 0 && !info[0].IsNull() ? info[0].As<Napi::String>().Utf8Value() : "";
     auto output = info.Length() > 1 && !info[1].IsNull() ? info[1].As<Napi::String>().Utf8Value() : "";
@@ -302,7 +390,7 @@ static Napi::Value SetDevice(const Napi::CallbackInfo& info)
     int bs = info.Length() > 3 && !info[3].IsUndefined() ? info[3].As<Napi::Number>().Int32Value() : 256;
 
     // Must run on the main thread — JUCE's ALSA backend deadlocks if called from a worker
-    bool result = engine->setAudioDevice(juce::String(input), juce::String(output), sr, bs);
+    bool result = liveEngine->setAudioDevice(juce::String(input), juce::String(output), sr, bs);
     return Napi::Boolean::New(env, result);
 }
 
@@ -310,19 +398,20 @@ static Napi::Value SetDevice(const Napi::CallbackInfo& info)
 
 static Napi::Value StartAudio(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->startAudio();
+    if (auto liveEngine = snapshotEngine()) liveEngine->startAudio();
     return info.Env().Undefined();
 }
 
 static Napi::Value StopAudio(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->stopAudio();
+    if (auto liveEngine = snapshotEngine()) liveEngine->stopAudio();
     return info.Env().Undefined();
 }
 
 static Napi::Value IsAudioRunning(const Napi::CallbackInfo& info)
 {
-    return Napi::Boolean::New(info.Env(), engine ? engine->isAudioRunning() : false);
+    auto liveEngine = snapshotEngine();
+    return Napi::Boolean::New(info.Env(), liveEngine ? liveEngine->isAudioRunning() : false);
 }
 
 // ── Gain ──────────────────────────────────────────────────────────────────────
@@ -330,30 +419,33 @@ static Napi::Value IsAudioRunning(const Napi::CallbackInfo& info)
 static Napi::Value SetGain(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 2) return env.Undefined();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 2) return env.Undefined();
 
     auto which = info[0].As<Napi::String>().Utf8Value();
     float value = info[1].As<Napi::Number>().FloatValue();
 
-    if (which == "input") engine->setInputGain(value);
-    else if (which == "output") engine->setOutputGain(value);
-    else if (which == "chain") engine->setChainOutputGain(value);
-    else if (which == "backing") engine->setBackingVolume(value);
+    if (which == "input") liveEngine->setInputGain(value);
+    else if (which == "output") liveEngine->setOutputGain(value);
+    else if (which == "chain") liveEngine->setChainOutputGain(value);
+    else if (which == "backing") liveEngine->setBackingVolume(value);
 
     return env.Undefined();
 }
 
 static Napi::Value SetInputChannel(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() > 0)
-        engine->setInputChannel(info[0].As<Napi::Number>().Int32Value());
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() > 0)
+        liveEngine->setInputChannel(info[0].As<Napi::Number>().Int32Value());
     return info.Env().Undefined();
 }
 
 static Napi::Value SetMonitorMute(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() > 0)
-        engine->setMonitorMute(info[0].As<Napi::Boolean>().Value());
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() > 0)
+        liveEngine->setMonitorMute(info[0].As<Napi::Boolean>().Value());
     return info.Env().Undefined();
 }
 
@@ -362,15 +454,17 @@ static Napi::Value SetMonitorMuteSuppressed(const Napi::CallbackInfo& info)
     // IsBoolean()-guarded so a mismatched renderer build / manual caller
     // passing a non-boolean is a clean no-op rather than a hard N-API failure
     // (NAPI_DISABLE_CPP_EXCEPTIONS is enabled). Mirrors SetNoiseGate's style.
-    if (engine && info.Length() > 0 && info[0].IsBoolean())
-        engine->setMonitorMuteSuppressed(info[0].As<Napi::Boolean>().Value());
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() > 0 && info[0].IsBoolean())
+        liveEngine->setMonitorMuteSuppressed(info[0].As<Napi::Boolean>().Value());
     return info.Env().Undefined();
 }
 
 static Napi::Value SetNoiseGate(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1 || !info[0].IsObject())
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
         return env.Undefined();
 
     auto o = info[0].As<Napi::Object>();
@@ -397,7 +491,7 @@ static Napi::Value SetNoiseGate(const Napi::CallbackInfo& info)
     if (o.Has("depthDb") && o.Get("depthDb").IsNumber())
         depthDb = (float)o.Get("depthDb").As<Napi::Number>().DoubleValue();
 
-    engine->setNoiseGate(enabled, thresholdDb, releaseMs, depthDb);
+    liveEngine->setNoiseGate(enabled, thresholdDb, releaseMs, depthDb);
     return env.Undefined();
 }
 
@@ -408,7 +502,8 @@ static Napi::Value SetTonePolish(const Napi::CallbackInfo& info)
     // non-object is a clean no-op rather than a hard N-API failure
     // (NAPI_DISABLE_CPP_EXCEPTIONS).
     auto env = info.Env();
-    if (!engine || info.Length() < 1 || !info[0].IsObject())
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
         return env.Undefined();
 
     auto o = info[0].As<Napi::Object>();
@@ -423,13 +518,14 @@ static Napi::Value SetTonePolish(const Napi::CallbackInfo& info)
             enabled = v.As<Napi::Number>().DoubleValue() != 0.0;
     }
 
-    engine->setTonePolishEnabled(enabled);
+    liveEngine->setTonePolishEnabled(enabled);
     return env.Undefined();
 }
 
 static Napi::Value IsMonitorMuted(const Napi::CallbackInfo& info)
 {
-    return Napi::Boolean::New(info.Env(), engine ? engine->isMonitorMuted() : true);
+    auto liveEngine = snapshotEngine();
+    return Napi::Boolean::New(info.Env(), liveEngine ? liveEngine->isMonitorMuted() : true);
 }
 
 // ── Metering (polled — read atomics) ──────────────────────────────────────────
@@ -438,13 +534,14 @@ static Napi::Value GetLevels(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
 
-    if (engine)
+    if (liveEngine)
     {
-        obj.Set("inputLevel", engine->getInputLevel());
-        obj.Set("outputLevel", engine->getOutputLevel());
-        obj.Set("inputPeak", engine->getInputPeak());
-        obj.Set("outputPeak", engine->getOutputPeak());
+        obj.Set("inputLevel", liveEngine->getInputLevel());
+        obj.Set("outputLevel", liveEngine->getOutputLevel());
+        obj.Set("inputPeak", liveEngine->getInputPeak());
+        obj.Set("outputPeak", liveEngine->getOutputPeak());
     }
     else
     {
@@ -459,7 +556,7 @@ static Napi::Value GetLevels(const Napi::CallbackInfo& info)
 
 static Napi::Value ResetPeaks(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->resetPeaks();
+    if (auto liveEngine = snapshotEngine()) liveEngine->resetPeaks();
     return info.Env().Undefined();
 }
 
@@ -476,11 +573,12 @@ static Napi::Value ResetPeaks(const Napi::CallbackInfo& info)
 static Napi::Value LoadNoteModel(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1 || !info[0].IsString())
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsString())
         return Napi::Boolean::New(env, false);
 
     const auto path = info[0].As<Napi::String>().Utf8Value();
-    const bool ok = engine->loadNoteModel(juce::File(juce::String(path)));
+    const bool ok = liveEngine->loadNoteModel(juce::File(juce::String(path)));
     return Napi::Boolean::New(env, ok);
 }
 
@@ -495,9 +593,10 @@ static Napi::Value IsMlNoteDetection(const Napi::CallbackInfo& info)
     // its first snapshot (isReady()). Reporting true during the cold-start
     // window would tell the renderer "ML active" while it's still getting the
     // YIN fallback.
+    auto liveEngine = snapshotEngine();
     return Napi::Boolean::New(env,
-        engine && engine->hasMlNoteDetector()
-              && engine->getMlNoteDetector().isReady());
+        liveEngine && liveEngine->hasMlNoteDetector()
+              && liveEngine->getMlNoteDetector().isReady());
 }
 
 // Raw polyphonic transcription from the ML note detector — the full set of
@@ -513,10 +612,11 @@ static Napi::Value DetectNotes(const Napi::CallbackInfo& info)
     // model, after a device stop, and during the cold-start window before the
     // first inference publishes — so the renderer feature-detects correctly
     // and falls back instead of consuming an empty ML stream.
-    if (!engine || !engine->getMlNoteDetector().isReady())
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || !liveEngine->getMlNoteDetector().isReady())
         return env.Null();
 
-    const auto active = engine->getMlNoteDetector().getActiveNotes();
+    const auto active = liveEngine->getMlNoteDetector().getActiveNotes();
     auto notesArr = Napi::Array::New(env, active.size());
     for (size_t i = 0; i < active.size(); ++i)
     {
@@ -537,7 +637,7 @@ static Napi::Value DetectNotes(const Napi::CallbackInfo& info)
     // Normalise the sample rate: getCurrentSampleRate() is 0 when no audio
     // device is active — hand the renderer a sane positive value so its
     // Hz/time math can't divide by zero.
-    const double sr = engine->getCurrentSampleRate();
+    const double sr = liveEngine->getCurrentSampleRate();
     obj.Set("sampleRate", sr > 0.0 ? sr : 48000.0);
     return obj;
 }
@@ -546,13 +646,14 @@ static Napi::Value GetPitchDetection(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
 
-    if (engine)
+    if (liveEngine)
     {
         // getActiveDetection() returns the polyphonic ML detector's dominant
         // pitch when a Basic Pitch model is loaded, else the YIN detector's
         // latest result — same shape either way, so the plugin is unchanged.
-        auto det = engine->getActiveDetection();
+        auto det = liveEngine->getActiveDetection();
         obj.Set("frequency", det.frequency);
         obj.Set("confidence", det.confidence);
         obj.Set("midiNote", det.midiNote);
@@ -610,6 +711,7 @@ static Napi::Value GetPitchDetection(const Napi::CallbackInfo& info)
 static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
+    auto liveEngine = snapshotEngine();
 
     // Hard caps on caller-controlled array lengths. The scorer's
     // (arrangement, stringCount) validation only accepts up to 8
@@ -636,7 +738,7 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
         return failure;
     };
 
-    if (!engine || info.Length() < 1 || !info[0].IsObject())
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
         return noRequestFailure();
 
     auto reqObj = info[0].As<Napi::Object>();
@@ -773,7 +875,7 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
         req.notes.push_back(n);
     }
 
-    auto result = engine->scoreChord(req);
+    auto result = liveEngine->scoreChord(req);
 
     auto out = Napi::Object::New(env);
     out.Set("score", result.score);
@@ -832,6 +934,7 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
 static Napi::Value SetChart(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
+    auto liveEngine = snapshotEngine();
 
     // Generous cap on the chart length — a full song's note list is well
     // under this, but it bounds the worst-case allocation a malformed payload
@@ -842,11 +945,11 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
     // currently holds — otherwise a failed (re)load leaves the previous
     // song's chart active and getNoteVerdicts() keeps emitting stale verdicts.
     auto reject = [&]() -> Napi::Value {
-        if (engine) engine->clearChart();
+        if (liveEngine) liveEngine->clearChart();
         return Napi::Boolean::New(info.Env(), false);
     };
 
-    if (!engine || info.Length() < 1 || !info[0].IsObject())
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
         return reject();
 
     auto reqObj = info[0].As<Napi::Object>();
@@ -927,7 +1030,7 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
         chart.notes.push_back(std::move(n));
     }
 
-    engine->setChart(chart);
+    liveEngine->setChart(chart);
     return Napi::Boolean::New(env, true);
 }
 
@@ -944,7 +1047,8 @@ static Napi::Value GetNoteVerdicts(const Napi::CallbackInfo& info)
     // Null (not an empty array) on a missing engine — the bridge/preload
     // contract treats null as "unsupported/unavailable" so the renderer
     // feature-detects, matching detectNotes' no-engine path.
-    if (!engine) return env.Null();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
 
     // Push the playhead before draining so this tick's verdicts reflect it.
     // A JS NaN/Infinity passes IsNumber() — guard with isfinite so a bad
@@ -953,10 +1057,10 @@ static Napi::Value GetNoteVerdicts(const Napi::CallbackInfo& info)
     {
         const double songTime = info[0].As<Napi::Number>().DoubleValue();
         if (std::isfinite(songTime))
-            engine->setPlayhead(songTime, info[1].As<Napi::Boolean>().Value());
+            liveEngine->setPlayhead(songTime, info[1].As<Napi::Boolean>().Value());
     }
 
-    const auto verdicts = engine->getNoteVerdicts();
+    const auto verdicts = liveEngine->getNoteVerdicts();
     auto arr = Napi::Array::New(env, verdicts.size());
     for (size_t i = 0; i < verdicts.size(); ++i)
     {
@@ -983,9 +1087,10 @@ static Napi::Value GetSampleRate(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     constexpr double kFallbackSampleRate = 48000.0;
-    if (!engine)
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine)
         return Napi::Number::New(env, kFallbackSampleRate);
-    const double sr = engine->getCurrentSampleRate();
+    const double sr = liveEngine->getCurrentSampleRate();
     if (!std::isfinite(sr) || sr <= 0.0)
         return Napi::Number::New(env, kFallbackSampleRate);
     return Napi::Number::New(env, sr);
@@ -1001,8 +1106,9 @@ public:
 
     void Execute() override
     {
-        if (!vstHost) return;
-        vstHost->scanDirectories(directories, [](float, const juce::String&) {});
+        auto host = snapshotVstHost();
+        if (!host) return;
+        host->scanDirectories(directories, [](float, const juce::String&) {});
     }
 
     void OnOK() override
@@ -1010,9 +1116,9 @@ public:
         auto env = Env();
         auto result = Napi::Array::New(env);
 
-        if (vstHost)
+        if (auto host = snapshotVstHost())
         {
-            auto plugins = vstHost->getKnownPlugins();
+            auto plugins = host->getKnownPlugins();
             for (int i = 0; i < plugins.size(); ++i)
             {
                 auto obj = Napi::Object::New(env);
@@ -1067,9 +1173,9 @@ static Napi::Value GetKnownPlugins(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto result = Napi::Array::New(env);
 
-    if (vstHost)
+    if (auto host = snapshotVstHost())
     {
-        auto plugins = vstHost->getKnownPlugins();
+        auto plugins = host->getKnownPlugins();
         for (int i = 0; i < plugins.size(); ++i)
         {
             auto obj = Napi::Object::New(env);
@@ -1089,15 +1195,17 @@ static Napi::Value GetKnownPlugins(const Napi::CallbackInfo& info)
 
 static Napi::Value SavePluginList(const Napi::CallbackInfo& info)
 {
-    if (vstHost && info.Length() > 0)
-        vstHost->savePluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
+    if (info.Length() == 0) return info.Env().Undefined();
+    if (auto host = snapshotVstHost())
+        host->savePluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
     return info.Env().Undefined();
 }
 
 static Napi::Value LoadPluginList(const Napi::CallbackInfo& info)
 {
-    if (vstHost && info.Length() > 0)
-        vstHost->loadPluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
+    if (info.Length() == 0) return info.Env().Undefined();
+    if (auto host = snapshotVstHost())
+        host->loadPluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
     return info.Env().Undefined();
 }
 
@@ -1124,16 +1232,56 @@ static Napi::Value SetCrashedPlugins(const Napi::CallbackInfo& info)
 
 // ── Signal Chain Management ──────────────────────────────────────────────────
 
+// Pending in-process loads: each LoadVSTWorker / LoadPresetWorker that's
+// currently blocked on `done->wait()` registers its event here. doShutdown
+// signals them all so the workers unblock and return a clean "cancelled"
+// error instead of hanging forever when the JUCE message thread is about
+// to be stopped (and any unfired callback would never arrive).
+static std::mutex pendingLoadsMutex;
+static std::set<std::shared_ptr<juce::WaitableEvent>> pendingLoads;
+
+static void registerPendingLoad(std::shared_ptr<juce::WaitableEvent> evt)
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    pendingLoads.insert(std::move(evt));
+}
+
+static void unregisterPendingLoad(const std::shared_ptr<juce::WaitableEvent>& evt)
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    pendingLoads.erase(evt);
+}
+
+static void cancelAllPendingLoads()
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    for (auto& evt : pendingLoads) evt->signal();
+    pendingLoads.clear();
+}
+
 // Load a VST3, routing it through the out-of-process sandbox when
 // shouldSandbox() says so (the filename pre-seed or the runtime crash
-// blocklist), otherwise loading it in-process on the JUCE message thread.
+// blocklist), otherwise loading it in-process. The in-process load uses
+// VSTHost::loadPluginAsync so the JUCE message thread keeps pumping during
+// the plugin's init — critical for plugins like AmpliTube that post WM_USER
+// / WM_TIMER messages to themselves while initialising. The sync
+// createPluginInstance would block the pump, those self-messages would
+// queue forever, and the plugin would end up half-wired (a pointer that
+// only gets written by a queued message stays null, and the editor crashes
+// on its first WindowProc dispatch — the AmpliTube failure signature).
+//
+// Threading: on !JUCE_MAC must be called from a libuv worker thread (NOT
+// the JS main thread, NOT the JUCE message thread) — the done->wait below
+// has to be on a thread that *isn't* the one running JUCE's pump or the
+// load can't complete. On JUCE_MAC the inline sync fallback is used and
+// the caller can be the Node/main thread (which is also JUCE's message
+// thread there); LoadVST does exactly that, while LoadPresetWorker still
+// hits this from a worker (a pre-existing macOS limitation).
 //
 // On a *required*-sandbox failure (the plugin matched shouldSandbox but the
 // sandbox couldn't spawn) this returns nullptr with `error` set and
 // `sandboxRequired` true, so the caller can choose how to surface it —
-// LoadVST throws to JS, LoadPreset just skips the slot. Used by both so a
-// crash-blocklisted plugin can never sneak back in-process via preset
-// restore.
+// LoadVSTWorker throws to JS, LoadPresetWorker just skips the slot.
 static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
     const juce::String& pluginPath, double sr, int bs,
     juce::String& error, bool& sandboxRequired)
@@ -1161,77 +1309,334 @@ static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
         return processor;
     }
 
-    // In-process JUCE load. Instantiate on the JUCE message thread for the
-    // COM-apartment reason documented in VSTHost::loadPlugin.
+   #if JUCE_MAC
+    // macOS has no separate JUCE message thread (see startJuceMessageThread /
+    // dispatchOnMessageThread): the JUCE MessageManager is bound to the
+    // Node/main thread, and dispatchOnMessageThread historically ran inline
+    // on the caller. A callAsync + done->wait pattern would queue a callback
+    // to a pump that may never run in this calling context.
     //
-    // dispatchOnMessageThread can return on its 15 s timeout while the lambda
-    // is still queued, so the lambda must not capture this (possibly unwound)
-    // stack frame by reference. Route the result through shared_ptrs that
-    // outlive both the caller and a late-running lambda.
-    auto instance = std::make_shared<std::unique_ptr<juce::AudioPluginInstance>>();
+    // Fall back to the sync loadPlugin, executed on whichever thread called
+    // in — the Node/main thread for LoadVST's JUCE_MAC branch (correct: that
+    // *is* the MessageManager thread on macOS), or a libuv worker thread for
+    // LoadPresetWorker (the pre-existing macOS constraint). Caveat: the
+    // existing dispatchOnMessageThread block on macOS already documents
+    // that "VST/AU plugin instantiation (which genuinely requires a message
+    // thread on macOS) is the one capability we give up until a proper
+    // libuv-based pump lands." LoadPresetWorker has called loadVstSandbox-
+    // Aware on a worker thread for ages under exactly the same constraint;
+    // moving LoadVST to AsyncWorker brings direct loads under the same
+    // (pre-existing) limitation. The AmpliTube-class self-message problem
+    // this PR targets is Windows-specific (Electron owns the OS main
+    // thread, forcing JUCE's MessageManager onto a background thread that
+    // createPluginInstance then blocks); macOS doesn't have that mismatch.
+    auto host = snapshotVstHost();
+    if (! host) { error = "vstHost not initialised"; return nullptr; }
+    juce::String err;
+    auto instance = host->loadPlugin(pluginPath, sr, bs, err);
+    if (! instance) error = err.isNotEmpty() ? err : juce::String("load failed");
+    return instance;
+   #else
+    // In-process: kick off createPluginInstanceAsync on the message thread,
+    // block *this* (libuv worker) thread on a WaitableEvent until the load
+    // callback fires. The message thread keeps pumping during the wait so
+    // the plugin's self-posted init messages dispatch and its state finishes
+    // wiring up before the editor is ever opened.
+    //
+    // All state passed across the thread hop is held by shared_ptr so it
+    // outlives the lambda even on an unexpected destructor / scope exit.
+    auto instance  = std::make_shared<std::unique_ptr<juce::AudioPluginInstance>>();
     auto loadError = std::make_shared<juce::String>();
-    dispatchOnMessageThread([pluginPath, sr, bs, instance, loadError]() {
-        if (vstHost)
-            *instance = vstHost->loadPlugin(pluginPath, sr, bs, *loadError);
-    });
+    auto done      = std::make_shared<juce::WaitableEvent>();
+
+    // Register BEFORE scheduling so a shutdown that lands between callAsync
+    // and the wait below can't miss us — cancelAllPendingLoads would
+    // otherwise see an empty set and the worker would block forever.
+    registerPendingLoad(done);
+
+    // Check alreadyShutDown after registering to catch the inverse race
+    // (shutdown ran before we registered): if it's already set, the
+    // shutdown won't see this event and we must bail ourselves.
+    if (alreadyShutDown.load(std::memory_order_acquire))
+    {
+        unregisterPendingLoad(done);
+        error = "shutdown in flight";
+        return nullptr;
+    }
+
+    // Snapshot a shared_ptr to vstHost so the async load and its inner
+    // continuation can keep VSTHost (and thus formatManager) alive even if
+    // shutdown resets the global mid-load. The inner callback captures the
+    // same hostKeeper, so JUCE retains it until createPluginInstanceAsync
+    // completes; once the callback destructs, the keeper drops, and if the
+    // global has been reset by then the VSTHost destructor runs safely
+    // (no work in flight). The snapshot itself goes through vstHostMutex
+    // so the shared_ptr copy can't race with shutdown's vstHost.reset().
+    auto hostKeeper = snapshotVstHost();
+
+    const bool scheduled = juce::MessageManager::callAsync(
+        [hostKeeper, pluginPath, sr, bs, instance, loadError, done]()
+        {
+            // Shutdown may have fired between callAsync queueing this
+            // lambda and the message thread picking it up. Bail before
+            // kicking off another in-flight createPluginInstanceAsync
+            // that the shutdown would otherwise have to wait on.
+            if (alreadyShutDown.load(std::memory_order_acquire))
+            {
+                *loadError = "shutdown in flight";
+                done->signal();
+                return;
+            }
+            if (! hostKeeper)
+            {
+                *loadError = "vstHost not initialised";
+                done->signal();
+                return;
+            }
+            hostKeeper->loadPluginAsync(
+                pluginPath, sr, bs,
+                [hostKeeper, instance, loadError, done]
+                (std::unique_ptr<juce::AudioPluginInstance> inst, juce::String err)
+                {
+                    *instance  = std::move(inst);
+                    *loadError = std::move(err);
+                    done->signal();
+                });
+        });
+
+    if (! scheduled)
+    {
+        // The message queue is gone (typically: shutdown in flight). The
+        // lambda will never run, so done would never signal — surface the
+        // failure rather than hanging the worker forever.
+        unregisterPendingLoad(done);
+        error = "message manager unavailable (shutdown?)";
+        return nullptr;
+    }
+
+    // No timeout: createPluginInstanceAsync is genuinely async (the message
+    // thread keeps pumping), so a slow first-run plugin (e.g. one doing a
+    // license check that exceeds 15 s) is allowed to take however long it
+    // takes. The old 15-second timeout in dispatchOnMessageThread could
+    // return early while the lambda was still running, then the lambda
+    // would construct a fully-initialised plugin only for it to immediately
+    // destruct because no one held a reference — running VST teardown on
+    // the message thread while the user had already moved on. That race is
+    // gone with this design.
+    //
+    // Tradeoff: this call holds a libuv threadpool worker for the duration
+    // of the plugin's init. Multiple concurrent hung loads could in theory
+    // starve other AsyncWorkers (fs / crypto). In practice plugin loads are
+    // user-driven and serialised (LoadPresetWorker loads slots one at a
+    // time), and a truly stuck load is bounded by app shutdown via
+    // cancelAllPendingLoads. A proper "fire-and-forget with a TSFN
+    // completion callback" model would eliminate the block entirely but
+    // requires a bigger API restructure than this PR's scope.
+    done->wait();
+    unregisterPendingLoad(done);
+
+    // Distinguish "shutdown cancelled us before the callback fired"
+    // (instance null AND error empty) from a normal load failure (instance
+    // null with error set) and a normal success.
+    if (! *instance && loadError->isEmpty())
+    {
+        error = "load cancelled (shutdown)";
+        return nullptr;
+    }
     error = *loadError;
     return std::move(*instance);
+   #endif
 }
+
+// AsyncWorker wrapper for LoadVST. Execute() runs on a libuv worker thread,
+// so loadVstSandboxAware can block-wait on the async load without freezing
+// the JS main thread or deadlocking the JUCE message thread.
+class LoadVSTWorker : public Napi::AsyncWorker
+{
+public:
+    LoadVSTWorker(Napi::Env env, Napi::Promise::Deferred deferred, std::string path)
+        : Napi::AsyncWorker(env)
+        , deferred_(deferred)
+        , pluginPath_(std::move(path)) {}
+
+    void Execute() override
+    {
+        // Snapshot engine + vstHost through their mutex-protected helpers so
+        // shutdown's reset on the message thread can't race the worker's
+        // dereferences below. The shared_ptr locals keep both objects alive
+        // for the duration of this worker even if the globals get reset
+        // mid-load. The atomic alreadyShutDown gate is the early-out: once
+        // it's set, the dispatched reset is on its way and there's no point
+        // continuing.
+        if (alreadyShutDown.load(std::memory_order_acquire))
+        {
+            error_ = "shutdown in flight";
+            return;
+        }
+        auto engineKeeper = snapshotEngine();
+        auto hostSnap     = snapshotVstHost();
+        if (!engineKeeper || !hostSnap)
+        {
+            error_ = "engine not initialised";
+            return;
+        }
+
+        const auto sr = engineKeeper->getCurrentSampleRate();
+        const auto bs = engineKeeper->getCurrentBlockSize();
+        const auto path = juce::String(pluginPath_);
+        VST_TRACE("LoadVSTWorker: path='%s' sr=%.0f bs=%d",
+                  pluginPath_.c_str(), sr, bs);
+
+        bool sandboxRequired = false;
+        juce::String err;
+        auto processor = loadVstSandboxAware(path, sr, bs, err, sandboxRequired);
+
+        if (sandboxRequired && !processor)
+        {
+            // The plugin's on the denylist and the sandbox couldn't spawn —
+            // falling back to in-process is what crashed the addon to begin
+            // with. Surface as a JS exception (handled in OnOK).
+            fprintf(stderr, "[LoadVST] Failed: %s\n", err.toRawUTF8());
+            error_ = err;
+            sandboxFailed_ = true;
+            return;
+        }
+
+        if (!processor)
+        {
+            fprintf(stderr, "[LoadVST] Failed: %s\n", err.toRawUTF8());
+            error_ = err;
+            return;
+        }
+
+        // Engine may have been torn down while we were waiting on the async
+        // load. The shared_ptr captures keep `processor` alive; just don't
+        // touch a freed engine. The processor destructs cleanly when this
+        // scope exits.
+        //
+        // Gate on alreadyShutDown (atomic, properly synchronised) before the
+        // raw engine/vstHost pointer reads — once that flag is set, the
+        // dispatched reset of engine/vstHost is on its way and any use of
+        // the pointers from this worker thread is racy. The atomic check is
+        // the authoritative "should I still be touching engine?" signal.
+        if (alreadyShutDown.load(std::memory_order_acquire))
+        {
+            error_ = "engine torn down during load";
+            return;
+        }
+        // Re-snapshot the engine — the original engineKeeper might have
+        // outlived a reset on the message thread, but the AudioEngine
+        // we're about to mutate must be the still-installed one. If the
+        // global has been reset, the local keeps the old engine alive but
+        // we shouldn't be adding slots to it any more.
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine || !snapshotVstHost())
+        {
+            error_ = "engine torn down during load";
+            return;
+        }
+
+        auto name = processor->getName();
+        slotId_ = liveEngine->getSignalChain().addProcessor(
+            std::move(processor),
+            ProcessorSlot::Type::VST,
+            name,
+            path);
+    }
+
+    void OnOK() override
+    {
+        if (sandboxFailed_)
+        {
+            // Match the prior LoadVST throw-on-required-sandbox-failure
+            // behaviour so renderers' try/catch keeps working.
+            deferred_.Reject(
+                Napi::Error::New(Env(), error_.toStdString()).Value());
+            return;
+        }
+        deferred_.Resolve(Napi::Number::New(Env(), slotId_));
+    }
+
+    void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    std::string pluginPath_;
+    int slotId_ = -1;
+    bool sandboxFailed_ = false;
+    juce::String error_;
+};
 
 static Napi::Value LoadVST(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || !vstHost || info.Length() < 1)
-        return Napi::Number::New(env, -1);
+    auto deferred = Napi::Promise::Deferred::New(env);
 
-    auto pluginPath = info[0].As<Napi::String>().Utf8Value();
-    int slotId = -1;
-
-    juce::String error;
-    std::unique_ptr<juce::AudioProcessor> processor;
-    auto sr = engine->getCurrentSampleRate();
-    auto bs = engine->getCurrentBlockSize();
-    VST_TRACE("LoadVST: path='%s' sr=%.0f bs=%d", pluginPath.c_str(), sr, bs);
-
-    // Load via the shared sandbox-aware path: shouldSandbox() routes denylist
-    // / crash-blocklist plugins out-of-process, everything else in-process.
-    bool sandboxRequired = false;
-    processor = loadVstSandboxAware(juce::String(pluginPath), sr, bs,
-                                    error, sandboxRequired);
-
-    // If the plugin is on the denylist, sandboxing is *required* — falling
-    // back to in-process is what crashed the addon to begin with. Surface the
-    // failure to the caller by throwing.
-    if (sandboxRequired && !processor)
+    if (!snapshotEngine() || !snapshotVstHost() || info.Length() < 1)
     {
-        // Mirror the in-process load's stderr format so a JS test harness or
-        // Electron renderer sees the same diagnostics regardless of path.
-        fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
-        // Throw a Napi::Error so the JS caller gets the actual sandbox-spawn
-        // diagnostic instead of an opaque -1. Renderers must `try/catch
-        // addon.loadVST(...)` to handle this path. Invariant: this `return`
-        // MUST happen before any engine->getSignalChain() mutation — the
-        // throw marks the napi call as having thrown, so any chain mutation
-        // between here and return would leave a dangling slot while JS sees
-        // an exception. The Napi::Number::New only satisfies the signature.
-        Napi::Error::New(env, error.toStdString())
-            .ThrowAsJavaScriptException();
-        return Napi::Number::New(env, -1);
+        deferred.Resolve(Napi::Number::New(env, -1));
+        return deferred.Promise();
     }
 
+    auto pluginPath = info[0].As<Napi::String>().Utf8Value();
+
+   #if JUCE_MAC
+    // On macOS the JUCE MessageManager is bound to the Node/main thread.
+    // Running this as an AsyncWorker would call vstHost->loadPlugin on a
+    // libuv worker thread, which JUCE documents as unsupported for VST/AU
+    // instantiation. Do the load synchronously on the Node/main thread
+    // (same as the pre-PR LoadVST) and return a resolved Promise to match
+    // the new signature. Pays the foreground-block cost the AsyncWorker
+    // path was supposed to avoid, but that's the existing macOS reality —
+    // dispatchOnMessageThread already runs inline there. The async-load
+    // motivation (AmpliTube blocking the background JUCE message thread
+    // under Electron) is a Windows-only problem.
+    // Snapshot once for the whole load so the same AudioEngine is used for
+    // the sr/bs reads and the addProcessor mutation, even if shutdown
+    // resets the global mid-call.
+    auto liveEngine = snapshotEngine();
+    if (! liveEngine)
+    {
+        deferred.Resolve(Napi::Number::New(env, -1));
+        return deferred.Promise();
+    }
+    juce::String error;
+    bool sandboxRequired = false;
+    auto processor = loadVstSandboxAware(
+        juce::String(pluginPath),
+        liveEngine->getCurrentSampleRate(),
+        liveEngine->getCurrentBlockSize(),
+        error, sandboxRequired);
+
+    if (sandboxRequired && !processor)
+    {
+        fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
+        deferred.Reject(
+            Napi::Error::New(env, error.toStdString()).Value());
+        return deferred.Promise();
+    }
+
+    int slotId = -1;
     if (processor)
     {
         auto name = processor->getName();
-        slotId = engine->getSignalChain().addProcessor(
+        slotId = liveEngine->getSignalChain().addProcessor(
             std::move(processor),
             ProcessorSlot::Type::VST,
             name,
             juce::String(pluginPath));
     }
     else
+    {
         fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
-
-    return Napi::Number::New(env, slotId);
+    }
+    deferred.Resolve(Napi::Number::New(env, slotId));
+    return deferred.Promise();
+   #else
+    auto* worker = new LoadVSTWorker(env, deferred, std::move(pluginPath));
+    worker->Queue();
+    return deferred.Promise();
+   #endif
 }
 
 class LoadNAMWorker : public Napi::AsyncWorker
@@ -1242,13 +1647,14 @@ public:
 
     void Execute() override
     {
-        if (!engine) { slotId_ = -1; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { slotId_ = -1; return; }
 
         auto processor = std::make_unique<NAMProcessor>();
         if (processor->loadModel(juce::File(juce::String(modelPath_))))
         {
             auto name = processor->getModelName();
-            slotId_ = engine->getSignalChain().addProcessor(
+            slotId_ = liveEngine->getSignalChain().addProcessor(
                 std::move(processor),
                 ProcessorSlot::Type::NAM,
                 "NAM: " + name,
@@ -1270,7 +1676,7 @@ static Napi::Value LoadNAMModel(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
 
-    if (!engine || info.Length() < 1) {
+    if (!snapshotEngine() || info.Length() < 1) {
         deferred.Resolve(Napi::Number::New(env, -1));
         return deferred.Promise();
     }
@@ -1289,15 +1695,18 @@ public:
 
     void Execute() override
     {
-        if (!engine) { slotId_ = -1; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { slotId_ = -1; return; }
 
+        const auto sr = liveEngine->getCurrentSampleRate();
+        const auto bs = liveEngine->getCurrentBlockSize();
         auto processor = std::make_unique<IRLoader>();
-        processor->setPlayConfigDetails(2, 2, engine->getCurrentSampleRate(), engine->getCurrentBlockSize());
-        processor->prepareToPlay(engine->getCurrentSampleRate(), engine->getCurrentBlockSize());
+        processor->setPlayConfigDetails(2, 2, sr, bs);
+        processor->prepareToPlay(sr, bs);
         if (processor->loadIR(juce::File(juce::String(irPath_))))
         {
             auto name = processor->getIRName();
-            slotId_ = engine->getSignalChain().addProcessor(
+            slotId_ = liveEngine->getSignalChain().addProcessor(
                     std::move(processor),
                     ProcessorSlot::Type::IR,
                     "IR: " + name,
@@ -1319,7 +1728,7 @@ static Napi::Value LoadIR(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
 
-    if (!engine || info.Length() < 1) {
+    if (!snapshotEngine() || info.Length() < 1) {
         deferred.Resolve(Napi::Number::New(env, -1));
         return deferred.Promise();
     }
@@ -1332,39 +1741,42 @@ static Napi::Value LoadIR(const Napi::CallbackInfo& info)
 
 static Napi::Value RemoveProcessor(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() > 0)
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() > 0)
     {
         int slotId = info[0].As<Napi::Number>().Int32Value();
-        engine->getSignalChain().removeProcessor(slotId);
+        liveEngine->getSignalChain().removeProcessor(slotId);
     }
     return info.Env().Undefined();
 }
 
 static Napi::Value MoveProcessor(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() >= 2)
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2)
     {
         int from = info[0].As<Napi::Number>().Int32Value();
         int to = info[1].As<Napi::Number>().Int32Value();
-        engine->getSignalChain().moveProcessor(from, to);
+        liveEngine->getSignalChain().moveProcessor(from, to);
     }
     return info.Env().Undefined();
 }
 
 static Napi::Value SetBypass(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() >= 2)
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2)
     {
         int slotId = info[0].As<Napi::Number>().Int32Value();
         bool bypassed = info[1].As<Napi::Boolean>().Value();
-        engine->getSignalChain().setBypass(slotId, bypassed);
+        liveEngine->getSignalChain().setBypass(slotId, bypassed);
     }
     return info.Env().Undefined();
 }
 
 static Napi::Value ClearChain(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->getSignalChain().clear();
+    if (auto liveEngine = snapshotEngine()) liveEngine->getSignalChain().clear();
     return info.Env().Undefined();
 }
 
@@ -1374,10 +1786,11 @@ static Napi::Value GetChainState(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto result = Napi::Array::New(env);
+    auto liveEngine = snapshotEngine();
 
-    if (engine)
+    if (liveEngine)
     {
-        auto slots = engine->getSignalChain().getAllSlots();
+        auto slots = liveEngine->getSignalChain().getAllSlots();
         for (int i = 0; i < slots.size(); ++i)
         {
             auto obj = Napi::Object::New(env);
@@ -1434,7 +1847,8 @@ public:
 static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1)
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1)
         return Napi::Boolean::New(env, false);
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
@@ -1452,7 +1866,7 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
         editorWindows.erase(it);
     }
 
-    auto slot = engine->getSignalChain().getSlot(slotId);
+    auto slot = liveEngine->getSignalChain().getSlot(slotId);
     if (!slot || !slot->processor || !slot->processor->hasEditor())
         return Napi::Boolean::New(env, false);
 
@@ -1504,10 +1918,11 @@ static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
 static Napi::Value GetParameters(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1) return Napi::Array::New(env);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1) return Napi::Array::New(env);
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
-    auto params = engine->getSignalChain().getParameters(slotId);
+    auto params = liveEngine->getSignalChain().getParameters(slotId);
     auto result = Napi::Array::New(env, params.size());
 
     for (int i = 0; i < params.size(); ++i)
@@ -1526,12 +1941,13 @@ static Napi::Value GetParameters(const Napi::CallbackInfo& info)
 
 static Napi::Value SetParameter(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() >= 3)
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 3)
     {
         int slotId = info[0].As<Napi::Number>().Int32Value();
         int paramIdx = info[1].As<Napi::Number>().Int32Value();
         float value = info[2].As<Napi::Number>().FloatValue();
-        engine->getSignalChain().setParameter(slotId, paramIdx, value);
+        liveEngine->getSignalChain().setParameter(slotId, paramIdx, value);
     }
     return info.Env().Undefined();
 }
@@ -1541,13 +1957,14 @@ static Napi::Value SetSlotState(const Napi::CallbackInfo& info)
 {
     // Type-guard both args (NAPI_DISABLE_CPP_EXCEPTIONS): a malformed IPC
     // payload is a clean no-op rather than a hard addon failure.
-    if (engine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsString())
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsString())
     {
         int slotId = info[0].As<Napi::Number>().Int32Value();
         auto base64 = info[1].As<Napi::String>().Utf8Value();
         juce::MemoryBlock mb;
         if (mb.fromBase64Encoding(juce::String(base64)) && mb.getSize() > 0)
-            engine->getSignalChain().setSlotState(slotId, mb);
+            liveEngine->getSignalChain().setSlotState(slotId, mb);
     }
     return info.Env().Undefined();
 }
@@ -1557,7 +1974,8 @@ static Napi::Value SetSlotState(const Napi::CallbackInfo& info)
 static Napi::Value SendMidiToSlot(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 4)
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 4)
         return Napi::Boolean::New(env, false);
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
@@ -1579,7 +1997,7 @@ static Napi::Value SendMidiToSlot(const Napi::CallbackInfo& info)
     else
         return Napi::Boolean::New(env, false);
 
-    engine->getSignalChain().queueMidiMessage(slotId, midiMsg);
+    liveEngine->getSignalChain().queueMidiMessage(slotId, midiMsg);
     return Napi::Boolean::New(env, true);
 }
 
@@ -1588,47 +2006,52 @@ static Napi::Value SendMidiToSlot(const Napi::CallbackInfo& info)
 static Napi::Value LoadBackingTrack(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1) return Napi::Boolean::New(env, false);
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1) return Napi::Boolean::New(env, false);
 
     auto path = info[0].As<Napi::String>().Utf8Value();
-    bool result = engine->loadBackingTrack(juce::File(juce::String(path)));
+    bool result = liveEngine->loadBackingTrack(juce::File(juce::String(path)));
     return Napi::Boolean::New(env, result);
 }
 
 static Napi::Value StartBacking(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->startBacking();
+    if (auto liveEngine = snapshotEngine()) liveEngine->startBacking();
     return info.Env().Undefined();
 }
 
 static Napi::Value StopBacking(const Napi::CallbackInfo& info)
 {
-    if (engine) engine->stopBacking();
+    if (auto liveEngine = snapshotEngine()) liveEngine->stopBacking();
     return info.Env().Undefined();
 }
 
 static Napi::Value SeekBacking(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() > 0)
-        engine->setBackingPosition(info[0].As<Napi::Number>().DoubleValue());
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() > 0)
+        liveEngine->setBackingPosition(info[0].As<Napi::Number>().DoubleValue());
     return info.Env().Undefined();
 }
 
 static Napi::Value GetBackingPosition(const Napi::CallbackInfo& info)
 {
-    double pos = engine ? engine->getBackingPosition() : 0.0;
+    auto liveEngine = snapshotEngine();
+    double pos = liveEngine ? liveEngine->getBackingPosition() : 0.0;
     return Napi::Number::New(info.Env(), pos);
 }
 
 static Napi::Value GetBackingDuration(const Napi::CallbackInfo& info)
 {
-    double dur = engine ? engine->getBackingDuration() : 0.0;
+    auto liveEngine = snapshotEngine();
+    double dur = liveEngine ? liveEngine->getBackingDuration() : 0.0;
     return Napi::Number::New(info.Env(), dur);
 }
 
 static Napi::Value IsBackingPlaying(const Napi::CallbackInfo& info)
 {
-    bool playing = engine ? engine->isBackingPlaying() : false;
+    auto liveEngine = snapshotEngine();
+    bool playing = liveEngine ? liveEngine->isBackingPlaying() : false;
     return Napi::Boolean::New(info.Env(), playing);
 }
 
@@ -1637,8 +2060,9 @@ static Napi::Value IsBackingPlaying(const Napi::CallbackInfo& info)
 static Napi::Value SavePreset(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine) return env.Null();
-    auto json = engine->getSignalChain().savePreset();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
+    auto json = liveEngine->getSignalChain().savePreset();
     return Napi::String::New(env, json.toStdString());
 }
 
@@ -1650,7 +2074,8 @@ public:
 
     void Execute() override
     {
-        if (!engine) { success_ = false; error_ = "No engine"; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { success_ = false; error_ = "No engine"; return; }
 
         auto parsed = juce::JSON::parse(juce::String(presetJson_));
         if (!parsed.isObject()) { success_ = false; error_ = "Invalid JSON"; return; }
@@ -1663,10 +2088,10 @@ public:
         if (!chainArray) { success_ = false; error_ = "No chain array"; return; }
 
         // Clear existing chain
-        engine->getSignalChain().clear();
+        liveEngine->getSignalChain().clear();
 
-        double sr = engine->getCurrentSampleRate();
-        int bs = engine->getCurrentBlockSize();
+        double sr = liveEngine->getCurrentSampleRate();
+        int bs = liveEngine->getCurrentBlockSize();
 
         for (auto& slotVar : *chainArray)
         {
@@ -1681,7 +2106,7 @@ public:
 
             std::unique_ptr<juce::AudioProcessor> processor;
 
-            if (type == (int)ProcessorSlot::Type::VST && vstHost)
+            if (type == (int)ProcessorSlot::Type::VST && snapshotVstHost())
             {
                 // Sandbox-aware load: a crash-blocklisted plugin restored
                 // from a preset must still go out-of-process, otherwise the
@@ -1720,13 +2145,13 @@ public:
             }
             else continue;
 
-            int slotId = engine->getSignalChain().addProcessor(
+            int slotId = liveEngine->getSignalChain().addProcessor(
                 std::move(processor),
                 (ProcessorSlot::Type)type,
                 name, path);
 
             if (bypassed && slotId >= 0)
-                engine->getSignalChain().setBypass(slotId, true);
+                liveEngine->getSignalChain().setBypass(slotId, true);
 
             // Restore processor state
             if (stateB64.isNotEmpty() && slotId >= 0)
@@ -1734,7 +2159,7 @@ public:
                 juce::MemoryBlock state;
                 if (state.fromBase64Encoding(stateB64))
                 {
-                    auto* slot = const_cast<ProcessorSlot*>(engine->getSignalChain().getSlot(slotId));
+                    auto* slot = const_cast<ProcessorSlot*>(liveEngine->getSignalChain().getSlot(slotId));
                     if (slot) slot->setState(state);
                 }
             }
@@ -1767,8 +2192,9 @@ static Napi::Value LoadPreset(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
+    auto liveEngine = snapshotEngine();
 
-    if (!engine || info.Length() < 1) {
+    if (!liveEngine || info.Length() < 1) {
         auto obj = Napi::Object::New(env);
         obj.Set("success", false);
         obj.Set("error", "No engine or missing argument");
@@ -1785,7 +2211,8 @@ static Napi::Value LoadPreset(const Napi::CallbackInfo& info)
 static Napi::Value SetMultiBypass(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || info.Length() < 1 || !info[0].IsArray())
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsArray())
         return Napi::Boolean::New(env, false);
 
     auto arr = info[0].As<Napi::Array>();
@@ -1799,7 +2226,7 @@ static Napi::Value SetMultiBypass(const Napi::CallbackInfo& info)
         changes.add({ slotId, bypassed });
     }
 
-    engine->getSignalChain().setMultiBypass(changes);
+    liveEngine->getSignalChain().setMultiBypass(changes);
     return Napi::Boolean::New(env, true);
 }
 

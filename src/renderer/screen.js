@@ -28,6 +28,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     let meterAnimFrame = null;
     let knownPlugins = [];
     let currentDeviceTypes = [];
+    let pendingDeviceSave = Promise.resolve();
+    let latestDeviceOptionsRequest = 0;
+    let lastAppliedDeviceSettings = null;
 
     // ── Elements ──────────────────────────────────────────────────────────────
     const $ = (id) => document.getElementById(id);
@@ -104,8 +107,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._aeFormatGainDbLabel = formatGainDbLabel;
 
     // ── Persistence ─────────────────────────────────────────────────────────
-    function saveDeviceSettings() {
-        localStorage.setItem('slopsmith-audio-device', JSON.stringify({
+    function captureDeviceSettings() {
+        return {
             type: deviceTypeSelect.value,
             input: inputDeviceSelect.value,
             output: outputDeviceSelect.value,
@@ -113,14 +116,281 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             bufferSize: bufferSizeSelect.value,
             inputChannel: inputChannelSelect.value,
             monitorMute: monitorMuteCheckbox.checked,
-        }));
+        };
     }
 
-    function loadDeviceSettings() {
+    function cloneDeviceSettings(settings) {
+        return { ...(settings || {}) };
+    }
+
+    function isDeviceSettingsObject(settings) {
+        return !!settings && typeof settings === 'object' && !Array.isArray(settings);
+    }
+
+    function getDeviceSettingsSavedAt(settings) {
+        const savedAt = Number(settings?.savedAt);
+        return Number.isFinite(savedAt) && savedAt > 0 ? savedAt : 0;
+    }
+
+    function isSelectSettingValue(value) {
+        return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value));
+    }
+
+    function normalizeSelectSettingValue(value) {
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+        return '';
+    }
+
+    function normalizeDeviceSettings(settings) {
+        if (!isDeviceSettingsObject(settings)) return null;
+        const hasExpectedShape =
+            typeof settings.type === 'string'
+            && typeof settings.input === 'string'
+            && typeof settings.output === 'string'
+            && isSelectSettingValue(settings.sampleRate)
+            && isSelectSettingValue(settings.bufferSize)
+            && isSelectSettingValue(settings.inputChannel);
+        if (!hasExpectedShape) return null;
+
+        const normalized = {
+            type: settings.type,
+            input: settings.input,
+            output: settings.output,
+            sampleRate: normalizeSelectSettingValue(settings.sampleRate),
+            bufferSize: normalizeSelectSettingValue(settings.bufferSize),
+            inputChannel: normalizeSelectSettingValue(settings.inputChannel),
+        };
+        if (typeof settings.monitorMute === 'boolean') normalized.monitorMute = settings.monitorMute;
+        const savedAt = Number(settings.savedAt);
+        if (Number.isFinite(savedAt) && savedAt > 0) normalized.savedAt = savedAt;
+        return normalized;
+    }
+
+    function rememberAppliedDeviceSettings(settings = captureDeviceSettings()) {
+        lastAppliedDeviceSettings = cloneDeviceSettings(settings);
+        return lastAppliedDeviceSettings;
+    }
+
+    function isDeviceFormApplied() {
+        if (!lastAppliedDeviceSettings) return false;
+        const current = captureDeviceSettings();
+        return current.type === String(lastAppliedDeviceSettings.type ?? '')
+            && current.input === String(lastAppliedDeviceSettings.input ?? '')
+            && current.output === String(lastAppliedDeviceSettings.output ?? '')
+            && current.sampleRate === String(lastAppliedDeviceSettings.sampleRate ?? '')
+            && current.bufferSize === String(lastAppliedDeviceSettings.bufferSize ?? '');
+    }
+
+    function saveDeviceSettings(settings = captureDeviceSettings()) {
+        const snapshot = {
+            ...cloneDeviceSettings(settings),
+            savedAt: Date.now(),
+        };
+        try { localStorage.setItem('slopsmith-audio-device', JSON.stringify(snapshot)); } catch (_) {}
+        pendingDeviceSave = pendingDeviceSave
+            .catch(() => null)
+            .then(() => {
+                if (typeof api.saveDeviceSettings === 'function') {
+                    return api.saveDeviceSettings(snapshot);
+                }
+                return null;
+            })
+            .catch((e) => console.warn('[audio-engine] Failed to save device settings:', e));
+        return pendingDeviceSave;
+    }
+
+    function saveAppliedDeviceSettings(overrides = {}) {
+        if (!lastAppliedDeviceSettings) return Promise.resolve(null);
+        const settings = {
+            ...cloneDeviceSettings(lastAppliedDeviceSettings),
+            ...overrides,
+        };
+        rememberAppliedDeviceSettings(settings);
+        return saveDeviceSettings(settings);
+    }
+
+    async function loadDeviceSettings() {
+        let fileSettings = null;
+        try {
+            if (typeof api.loadDeviceSettings === 'function') {
+                fileSettings = normalizeDeviceSettings(await api.loadDeviceSettings());
+            }
+        } catch (e) {
+            console.warn('[audio-engine] Failed to load file-backed device settings:', e);
+        }
+        let browserSettings = null;
         try {
             const raw = localStorage.getItem('slopsmith-audio-device');
-            return raw ? JSON.parse(raw) : null;
-        } catch { return null; }
+            browserSettings = normalizeDeviceSettings(raw ? JSON.parse(raw) : null);
+        } catch { browserSettings = null; }
+        if (fileSettings && browserSettings) {
+            return getDeviceSettingsSavedAt(browserSettings) > getDeviceSettingsSavedAt(fileSettings)
+                ? browserSettings
+                : fileSettings;
+        }
+        return fileSettings || browserSettings;
+    }
+
+    function hasSettingValue(value) {
+        return value !== undefined && value !== null && value !== '';
+    }
+
+    function selectHasValue(select, value) {
+        if (!select) return false;
+        const s = String(value);
+        return Array.from(select.options).some(opt => opt.value === s);
+    }
+
+    function setSelectValueIfPresent(select, value) {
+        if (hasSettingValue(value) && selectHasValue(select, value)) {
+            select.value = String(value);
+            return true;
+        }
+        return false;
+    }
+
+    function replaceSelectOptions(select, choices, preferredValue) {
+        if (!select) return;
+        const previous = select.value;
+        select.innerHTML = '';
+        for (const choice of choices) {
+            const opt = document.createElement('option');
+            opt.value = String(choice.value);
+            opt.textContent = choice.label;
+            select.appendChild(opt);
+        }
+        if (!setSelectValueIfPresent(select, preferredValue)) {
+            setSelectValueIfPresent(select, previous);
+        }
+    }
+
+    function formatBufferOption(size, sampleRate) {
+        const n = Number(size);
+        const rate = Number(sampleRate) || 48000;
+        const ms = rate > 0 ? (n / rate) * 1000 : 0;
+        return `${n} samples (~${ms.toFixed(1)}ms)`;
+    }
+
+    function renderSampleRateOptions(sampleRates, preferredValue) {
+        const values = (Array.isArray(sampleRates) && sampleRates.length > 0 ? sampleRates : [44100, 48000, 96000])
+            .map(Number)
+            .filter(Number.isFinite);
+        const preferred = Number(preferredValue);
+        const preferredAvailable = Number.isFinite(preferred) && values.includes(preferred);
+        const unique = Array.from(new Set(values)).sort((a, b) => a - b);
+        replaceSelectOptions(
+            sampleRateSelect,
+            unique.map(rate => ({ value: rate, label: `${rate} Hz` })),
+            preferredAvailable ? preferredValue : null
+        );
+    }
+
+    function renderBufferSizeOptions(bufferSizes, preferredValue) {
+        const rate = Number(sampleRateSelect?.value) || 48000;
+        const values = (Array.isArray(bufferSizes) && bufferSizes.length > 0 ? bufferSizes : [64, 128, 256, 512, 1024])
+            .map(Number)
+            .filter(Number.isFinite);
+        const preferred = Number(preferredValue);
+        const preferredAvailable = Number.isFinite(preferred) && values.includes(preferred);
+        const unique = Array.from(new Set(values)).sort((a, b) => a - b);
+        replaceSelectOptions(
+            bufferSizeSelect,
+            unique.map(size => ({ value: size, label: formatBufferOption(size, rate) })),
+            preferredAvailable ? preferredValue : null
+        );
+    }
+
+    function renderInputChannelOptions(inputChannels, preferredValue) {
+        const current = hasSettingValue(inputChannelSelect.value) ? inputChannelSelect.value : '-1';
+        const names = Array.isArray(inputChannels) ? inputChannels.map(String) : [];
+        const count = names.length > 0 ? names.length : 2;
+        const preferred = hasSettingValue(preferredValue) ? String(preferredValue) : current;
+        const preferredIndex = Number(preferred);
+        const preferredAvailable = preferredIndex === -1
+            || (Number.isInteger(preferredIndex) && preferredIndex >= 0 && preferredIndex < count);
+        const currentIndex = Number(current);
+        const currentAvailable = currentIndex === -1
+            || (Number.isInteger(currentIndex) && currentIndex >= 0 && currentIndex < count);
+        const choices = [{ value: -1, label: count > 1 ? 'Default pair (Mono Mix)' : 'Default input' }];
+
+        for (let i = 0; i < count; i++) {
+            const name = names[i]?.trim();
+            const channelNumber = i + 1;
+            choices.push({
+                value: i,
+                label: name ? `${name} (Input ${channelNumber}, Ch ${channelNumber})` : `Input ${channelNumber} (Ch ${channelNumber})`,
+            });
+        }
+
+        replaceSelectOptions(inputChannelSelect, choices, preferredAvailable ? preferred : (currentAvailable ? current : '-1'));
+    }
+
+    function coerceAsioSingleDriverSelection() {
+        if (deviceTypeSelect.value !== 'ASIO') return false;
+        if (!inputDeviceSelect.value && !outputDeviceSelect.value) return false;
+        if (inputDeviceSelect.value && !outputDeviceSelect.value) {
+            if (selectHasValue(outputDeviceSelect, inputDeviceSelect.value)) {
+                outputDeviceSelect.value = inputDeviceSelect.value;
+                return true;
+            }
+            return false;
+        }
+        if (!inputDeviceSelect.value && outputDeviceSelect.value) {
+            if (selectHasValue(inputDeviceSelect, outputDeviceSelect.value)) {
+                inputDeviceSelect.value = outputDeviceSelect.value;
+                return true;
+            }
+            return false;
+        }
+        if (inputDeviceSelect.value === outputDeviceSelect.value) return false;
+
+        if (selectHasValue(outputDeviceSelect, inputDeviceSelect.value)) {
+            outputDeviceSelect.value = inputDeviceSelect.value;
+            return true;
+        }
+        if (selectHasValue(inputDeviceSelect, outputDeviceSelect.value)) {
+            inputDeviceSelect.value = outputDeviceSelect.value;
+            return true;
+        }
+        return false;
+    }
+
+    async function refreshDeviceOptions(preferred = {}) {
+        const requestId = ++latestDeviceOptionsRequest;
+        if (!api || typeof api.probeDeviceOptions !== 'function') {
+            renderInputChannelOptions([], preferred.inputChannel);
+            renderSampleRateOptions([], preferred.sampleRate);
+            renderBufferSizeOptions([], preferred.bufferSize);
+            return null;
+        }
+
+        coerceAsioSingleDriverSelection();
+        const requestedType = deviceTypeSelect.value;
+        const requestedInput = inputDeviceSelect.value;
+        const requestedOutput = outputDeviceSelect.value;
+        let options = null;
+        try {
+            options = await api.probeDeviceOptions(
+                requestedType,
+                requestedInput,
+                requestedOutput
+            );
+        } catch (e) {
+            console.warn('[audio-engine] Failed to probe device options:', e);
+        }
+
+        if (requestId !== latestDeviceOptionsRequest
+            || deviceTypeSelect.value !== requestedType
+            || inputDeviceSelect.value !== requestedInput
+            || outputDeviceSelect.value !== requestedOutput) {
+            return null;
+        }
+
+        renderSampleRateOptions(options?.sampleRates, preferred.sampleRate);
+        renderBufferSizeOptions(options?.bufferSizes, preferred.bufferSize);
+        renderInputChannelOptions(options?.inputChannels, preferred.inputChannel);
+        return options;
     }
 
     // ── Noise gate (AmpliTube-style: threshold, release ms, depth dB → native setNoiseGate) ──
@@ -324,36 +594,43 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         startMetering();
 
         // Restore saved device settings and auto-start
-        const saved = loadDeviceSettings();
+        const saved = await loadDeviceSettings();
         if (saved) {
-            if (saved.type && deviceTypeSelect.querySelector(`option[value="${saved.type}"]`)) {
+            if (saved.type && selectHasValue(deviceTypeSelect, saved.type)) {
                 deviceTypeSelect.value = saved.type;
                 const typeInfo = currentDeviceTypes.find(t => t.name === saved.type);
                 if (typeInfo) updateDeviceDropdowns(typeInfo);
             }
-            if (saved.input) inputDeviceSelect.value = saved.input;
-            if (saved.output) outputDeviceSelect.value = saved.output;
-            if (saved.sampleRate) sampleRateSelect.value = saved.sampleRate;
-            if (saved.bufferSize) bufferSizeSelect.value = saved.bufferSize;
-            if (saved.inputChannel) inputChannelSelect.value = saved.inputChannel;
+            if ('input' in saved && selectHasValue(inputDeviceSelect, saved.input)) inputDeviceSelect.value = String(saved.input);
+            if ('output' in saved && selectHasValue(outputDeviceSelect, saved.output)) outputDeviceSelect.value = String(saved.output);
+            await refreshDeviceOptions({
+                sampleRate: saved.sampleRate,
+                bufferSize: saved.bufferSize,
+                inputChannel: saved.inputChannel,
+            });
+            setSelectValueIfPresent(sampleRateSelect, saved.sampleRate);
+            setSelectValueIfPresent(bufferSizeSelect, saved.bufferSize);
+            setSelectValueIfPresent(inputChannelSelect, saved.inputChannel);
             if (saved.monitorMute !== undefined) monitorMuteCheckbox.checked = saved.monitorMute;
 
             // Auto-apply and start
-            await api.setDeviceType(saved.type);
+            await api.setDeviceType(deviceTypeSelect.value);
             const ok = await api.setDevice(
-                saved.input || '', saved.output || '',
-                parseFloat(saved.sampleRate || '48000'),
-                parseInt(saved.bufferSize || '256')
+                inputDeviceSelect.value, outputDeviceSelect.value,
+                parseFloat(sampleRateSelect.value || '48000'),
+                parseInt(bufferSizeSelect.value || '256')
             );
             if (ok) {
-                if (saved.inputChannel) api.setInputChannel(parseInt(saved.inputChannel));
-                if (saved.monitorMute !== undefined) api.setMonitorMute(saved.monitorMute);
+                const inputChannel = parseInt(inputChannelSelect.value);
+                if (Number.isFinite(inputChannel)) await api.setInputChannel(inputChannel);
+                if (saved.monitorMute !== undefined) await api.setMonitorMute(saved.monitorMute);
                 await api.startAudio();
                 audioRunning = true;
                 toggleBtn.textContent = 'Stop';
                 statusDot.className = 'w-3 h-3 rounded-full bg-emerald-500';
                 statusText.textContent = 'Audio running';
                 aeApplyNoiseGateToEngine();
+                rememberAppliedDeviceSettings();
                 aeApplyTonePolishToEngine();
             }
         }
@@ -470,6 +747,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             if (current.input) inputDeviceSelect.value = current.input;
             if (current.output) outputDeviceSelect.value = current.output;
         }
+
+        await refreshDeviceOptions();
     }
 
     function updateDeviceDropdowns(typeInfo) {
@@ -654,9 +933,25 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         });
 
         // Device type change
-        deviceTypeSelect.addEventListener('change', () => {
+        deviceTypeSelect.addEventListener('change', async () => {
             const typeInfo = currentDeviceTypes.find(t => t.name === deviceTypeSelect.value);
             if (typeInfo) updateDeviceDropdowns(typeInfo);
+            await refreshDeviceOptions();
+        });
+
+        inputDeviceSelect.addEventListener('change', async () => {
+            await refreshDeviceOptions();
+        });
+
+        outputDeviceSelect.addEventListener('change', async () => {
+            await refreshDeviceOptions();
+        });
+
+        sampleRateSelect.addEventListener('change', () => {
+            renderBufferSizeOptions(
+                Array.from(bufferSizeSelect.options).map(opt => Number(opt.value)),
+                bufferSizeSelect.value
+            );
         });
 
         // Apply device settings and start audio
@@ -668,6 +963,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 audioRunning = false;
             }
             const typeName = deviceTypeSelect.value;
+            if (coerceAsioSingleDriverSelection()) {
+                statusText.textContent = 'ASIO uses one driver; matching input and output...';
+            }
             await api.setDeviceType(typeName);
             const ok = await api.setDevice(
                 inputDeviceSelect.value,
@@ -676,6 +974,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 parseInt(bufferSizeSelect.value)
             );
             if (ok) {
+                const inputChannel = parseInt(inputChannelSelect.value);
+                if (Number.isFinite(inputChannel)) await api.setInputChannel(inputChannel);
+                await api.setMonitorMute(monitorMuteCheckbox.checked);
                 await api.startAudio();
                 audioRunning = true;
                 toggleBtn.textContent = 'Stop';
@@ -683,7 +984,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 statusText.textContent = 'Audio running';
                 aeApplyNoiseGateToEngine();
                 aeApplyTonePolishToEngine();
-                saveDeviceSettings();
+                const applied = rememberAppliedDeviceSettings();
+                await saveDeviceSettings(applied);
             } else {
                 statusText.textContent = 'Failed to configure device';
                 statusDot.className = 'w-3 h-3 rounded-full bg-red-500';
@@ -691,13 +993,21 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         });
 
         // Input channel
-        inputChannelSelect.addEventListener('change', () => {
-            api.setInputChannel(parseInt(inputChannelSelect.value));
+        inputChannelSelect.addEventListener('change', async () => {
+            const inputChannel = parseInt(inputChannelSelect.value);
+            if (!Number.isFinite(inputChannel)) return;
+            if (!isDeviceFormApplied()) {
+                statusText.textContent = 'Apply device settings to use this input channel';
+                return;
+            }
+            await api.setInputChannel(inputChannel);
+            await saveAppliedDeviceSettings({ inputChannel: inputChannelSelect.value });
         });
 
         // Monitor mute
-        monitorMuteCheckbox.addEventListener('change', () => {
-            api.setMonitorMute(monitorMuteCheckbox.checked);
+        monitorMuteCheckbox.addEventListener('change', async () => {
+            await api.setMonitorMute(monitorMuteCheckbox.checked);
+            await saveAppliedDeviceSettings({ monitorMute: monitorMuteCheckbox.checked });
         });
 
         // Gain sliders (UI dB → linear amplitude for engine)
@@ -876,6 +1186,176 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
         setupAudioQualityControls();
         setupToneAutomationSettingsEvents();
+        setupUpdateChannelControls();
+    }
+
+    // ── Updater (Velopack) settings UI ────────────────────────────────────────
+    // Reads/writes the persisted channel in localStorage and talks to the main
+    // process via window.slopsmithDesktop.update (added by the main-process slice).
+    // Designed to degrade gracefully when the updater IPC namespace is missing
+    // (dev builds before the main slice lands) or when running on Linux.
+    function setupUpdateChannelControls() {
+        const channelSelect = document.getElementById('update-channel');
+        const checkBtn = document.getElementById('update-check-now');
+        const statusEl = document.getElementById('update-status');
+        const linuxNote = document.getElementById('update-linux-note');
+        if (!channelSelect || !checkBtn || !statusEl) return;
+
+        const VALID_CHANNELS = ['stable', 'rc', 'beta', 'alpha'];
+        const storedChannelRaw = localStorage.getItem('slopsmith-update-channel');
+        const storedChannel = VALID_CHANNELS.includes(storedChannelRaw) ? storedChannelRaw : 'stable';
+        channelSelect.value = storedChannel;
+
+        const updateApi = window.slopsmithDesktop?.update;
+        const isLinux = window.slopsmithDesktop?.platform === 'linux';
+
+        function showLinuxFallback(message) {
+            if (linuxNote) linuxNote.classList.remove('hidden');
+            channelSelect.disabled = true;
+            checkBtn.disabled = true;
+            statusEl.textContent = message || 'Auto-update is not available on this platform.';
+        }
+
+        if (!updateApi) {
+            statusEl.textContent = 'Updater not initialized (running in dev or unsupported build).';
+            channelSelect.disabled = true;
+            checkBtn.disabled = true;
+            return;
+        }
+
+        if (isLinux) {
+            showLinuxFallback('Auto-update is not available on Linux.');
+            // Still inform main of the persisted channel so cross-platform logic stays consistent.
+            try { void updateApi.setChannel(storedChannel); } catch (_) { /* defensive */ }
+            return;
+        }
+
+        function fmtTimestamp(ts) {
+            if (!ts) return 'never';
+            try {
+                const d = new Date(ts);
+                if (Number.isNaN(d.getTime())) return 'never';
+                return d.toLocaleString();
+            } catch (_) {
+                return 'never';
+            }
+        }
+
+        function renderStatus(extra) {
+            try {
+                void updateApi.getStatus().then((s) => {
+                    if (!s) {
+                        statusEl.textContent = extra || 'Updater status unavailable.';
+                        return;
+                    }
+                    if (s.status === 'unsupported' || s.platform === 'linux') {
+                        showLinuxFallback('Auto-update is not available on Linux.');
+                        return;
+                    }
+                    if (s.status === 'error') {
+                        // Surface the error message so users can tell why update
+                        // checks are failing rather than seeing a healthy status.
+                        const errMsg = s.message ? `Update error: ${s.message}` : 'Update check failed.';
+                        statusEl.textContent = extra ? `${extra} · ${errMsg}` : errMsg;
+                        return;
+                    }
+                    const parts = [
+                        `Version ${s.currentVersion || '?'}`,
+                        `channel ${s.channel || channelSelect.value}`,
+                        `last checked ${fmtTimestamp(s.lastChecked)}`,
+                    ];
+                    statusEl.textContent = extra ? `${extra} · ${parts.join(' · ')}` : parts.join(' · ');
+                }).catch((e) => {
+                    console.warn('[updater] getStatus failed:', e);
+                    statusEl.textContent = extra || 'Failed to read updater status.';
+                });
+            } catch (e) {
+                console.warn('[updater] getStatus threw:', e);
+                statusEl.textContent = extra || 'Failed to read updater status.';
+            }
+        }
+
+        // Inform main of the persisted channel on panel load.
+        try {
+            void Promise.resolve(updateApi.setChannel(storedChannel)).catch((e) => {
+                console.warn('[updater] setChannel(initial) failed:', e);
+            });
+        } catch (e) {
+            console.warn('[updater] setChannel(initial) threw:', e);
+        }
+
+        // setupUpdateChannelControls() re-runs if screen.js is re-evaluated.
+        // Drop the change/click handlers a previous evaluation bound (a no-op
+        // if the element was replaced) so they don't stack into duplicate
+        // setChannel()/checkNow() IPC calls per user action.
+        if (hookState.updateChannelOnChange) {
+            channelSelect.removeEventListener('change', hookState.updateChannelOnChange);
+        }
+        if (hookState.updateCheckOnClick) {
+            checkBtn.removeEventListener('click', hookState.updateCheckOnClick);
+        }
+
+        const onChannelChange = () => {
+            const val = channelSelect.value;
+            if (!VALID_CHANNELS.includes(val)) return;
+            try { localStorage.setItem('slopsmith-update-channel', val); } catch (_) {}
+            try {
+                void Promise.resolve(updateApi.setChannel(val)).catch((e) => {
+                    console.warn('[updater] setChannel failed:', e);
+                });
+            } catch (e) {
+                console.warn('[updater] setChannel threw:', e);
+            }
+            renderStatus(`Channel set to ${val}.`);
+        };
+        channelSelect.addEventListener('change', onChannelChange);
+        hookState.updateChannelOnChange = onChannelChange;
+
+        const onCheckClick = async () => {
+            checkBtn.disabled = true;
+            statusEl.textContent = 'Checking for updates…';
+            // Track whether we should re-enable the button in finally. On
+            // unsupported platforms showLinuxFallback() permanently disables
+            // the button; the finally block must not undo that.
+            let reEnableBtn = true;
+            try {
+                const result = await updateApi.checkNow();
+                const status = result?.status || 'unknown';
+                let msg;
+                switch (status) {
+                    case 'idle':
+                        // checkNow() returned null info — no update available in this channel.
+                        msg = "You're on the newest version in this channel.";
+                        break;
+                    case 'downloading':
+                        // Update found; download kicked off automatically by checkNow().
+                        msg = `Update available — downloading…`;
+                        break;
+                    case 'downloaded':
+                        msg = 'Update downloaded — restart to apply.';
+                        break;
+                    case 'unsupported':
+                        reEnableBtn = false;
+                        showLinuxFallback('Auto-update is not available on Linux.');
+                        return;
+                    case 'error':
+                        msg = `Update check failed${result?.message ? `: ${result.message}` : '.'}`;
+                        break;
+                    default:
+                        msg = `Update check returned: ${status}`;
+                }
+                renderStatus(msg);
+            } catch (e) {
+                console.warn('[updater] checkNow failed:', e);
+                statusEl.textContent = `Update check failed: ${e?.message || e}`;
+            } finally {
+                if (reEnableBtn) checkBtn.disabled = false;
+            }
+        };
+        checkBtn.addEventListener('click', onCheckClick);
+        hookState.updateCheckOnClick = onCheckClick;
+
+        renderStatus();
     }
 
     // ── Audio Quality (soundfont) ─────────────────────────────────────────────
@@ -3380,4 +3860,150 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
     // Allow app.js to finish initialising before querying the DOM.
     setTimeout(tryInjectChainButton, 0);
+})();
+
+// ── Update-downloaded restart banner (top-level, runs even without audio API) ──
+// Subscribes to window.slopsmithDesktop.update.onDownloaded and renders a
+// persistent banner with a "Restart now" button. Degrades silently when the
+// updater IPC namespace is unavailable (e.g. dev builds before the main slice
+// lands, or unsupported platforms).
+(function() {
+    'use strict';
+    const updateApi = window.slopsmithDesktop?.update;
+    if (!updateApi || typeof updateApi.onDownloaded !== 'function') return;
+
+    const BANNER_ID = 'slopsmith-update-banner';
+
+    // This IIFE re-runs if screen.js is re-evaluated. onDownloaded() returns an
+    // unsubscribe fn — drop the listener a previous evaluation registered so
+    // they don't pile up (renderUpdateBanner() de-dupes the DOM node, but the
+    // listeners themselves would still leak).
+    const hookState = window.__slopsmithDesktopAudioHooks;
+    if (typeof hookState.updateBannerUnsub === 'function') {
+        try { hookState.updateBannerUnsub(); } catch (_) { /* defensive */ }
+        hookState.updateBannerUnsub = null;
+    }
+
+    function renderUpdateBanner(payload) {
+        // Avoid stacking duplicate banners if onDownloaded fires more than once.
+        if (document.getElementById(BANNER_ID)) return;
+
+        const banner = document.createElement('div');
+        banner.id = BANNER_ID;
+        banner.setAttribute('role', 'status');
+        banner.style.cssText = [
+            'position:fixed',
+            'top:0',
+            'left:0',
+            'right:0',
+            'z-index:99999',
+            'padding:10px 16px',
+            'background:linear-gradient(90deg,#1e3a8a,#4338ca)',
+            'color:#fff',
+            'font-size:13px',
+            'font-family:system-ui,sans-serif',
+            'display:flex',
+            'align-items:center',
+            'justify-content:space-between',
+            'gap:12px',
+            'box-shadow:0 2px 8px rgba(0,0,0,0.4)',
+        ].join(';');
+
+        const text = document.createElement('span');
+        const version = payload && payload.version ? ` (${payload.version})` : '';
+        text.textContent = `Update downloaded${version} — restart to apply.`;
+
+        const actions = document.createElement('span');
+        actions.style.cssText = 'display:flex;gap:8px;align-items:center';
+
+        const restartBtn = document.createElement('button');
+        restartBtn.textContent = 'Restart now';
+        restartBtn.style.cssText = [
+            'padding:4px 12px',
+            'border-radius:4px',
+            'background:#fff',
+            'color:#1e3a8a',
+            'border:none',
+            'font-weight:600',
+            'cursor:pointer',
+            'font-size:13px',
+        ].join(';');
+        restartBtn.addEventListener('click', async () => {
+            restartBtn.disabled = true;
+            restartBtn.textContent = 'Restarting…';
+            try {
+                // apply() can resolve with { status: 'error' } instead of
+                // throwing. On success the app quits, so reaching past this
+                // with a non-error status is fine — only an error result
+                // needs the button re-enabled for a retry.
+                const result = await updateApi.apply();
+                if (result?.status === 'error') {
+                    console.warn('[updater] apply returned error:', result.message || 'unknown');
+                    restartBtn.disabled = false;
+                    restartBtn.textContent = 'Restart now';
+                }
+            } catch (e) {
+                console.warn('[updater] apply failed:', e);
+                restartBtn.disabled = false;
+                restartBtn.textContent = 'Restart now';
+            }
+        });
+
+        const dismissBtn = document.createElement('button');
+        dismissBtn.textContent = 'Later';
+        dismissBtn.setAttribute('aria-label', 'Dismiss update banner');
+        dismissBtn.style.cssText = [
+            'padding:4px 10px',
+            'border-radius:4px',
+            'background:transparent',
+            'color:#fff',
+            'border:1px solid rgba(255,255,255,0.4)',
+            'cursor:pointer',
+            'font-size:13px',
+        ].join(';');
+        dismissBtn.addEventListener('click', () => {
+            banner.remove();
+        });
+
+        actions.appendChild(restartBtn);
+        actions.appendChild(dismissBtn);
+        banner.appendChild(text);
+        banner.appendChild(actions);
+
+        const insert = () => {
+            if (document.body) document.body.appendChild(banner);
+            else document.addEventListener('DOMContentLoaded', () => document.body.appendChild(banner), { once: true });
+        };
+        insert();
+    }
+
+    try {
+        const unsub = updateApi.onDownloaded((payload) => {
+            try {
+                renderUpdateBanner(payload);
+            } catch (e) {
+                console.warn('[updater] renderUpdateBanner failed:', e);
+            }
+        });
+        if (typeof unsub === 'function') hookState.updateBannerUnsub = unsub;
+    } catch (e) {
+        console.warn('[updater] onDownloaded subscribe failed:', e);
+    }
+
+    // Check on init for an already-downloaded update (e.g. the user restarted
+    // the app without applying a pending update, or the update was downloaded
+    // in a previous session). The onDownloaded event only fires when a download
+    // completes in the *current* session, so we need an explicit status check
+    // to catch pre-existing pending updates.
+    try {
+        void Promise.resolve(updateApi.getStatus()).then((status) => {
+            if (status && status.status === 'downloaded' && status.pending && status.pending.version) {
+                renderUpdateBanner({ version: status.pending.version, channel: status.channel });
+            }
+        }).catch((e) => {
+            console.warn('[updater] getStatus on init failed:', e);
+        });
+    } catch (e) {
+        console.warn('[updater] getStatus on init threw:', e);
+    }
 })();

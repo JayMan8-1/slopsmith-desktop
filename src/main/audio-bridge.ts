@@ -4,6 +4,7 @@
 
 import { ipcMain } from 'electron';
 import * as path from 'path';
+import * as fs from 'fs';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
 import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } from './vst-crash-guard';
@@ -11,6 +12,115 @@ import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } fro
 type AudioModule = Record<string, (...args: any[]) => any>;
 
 let audio: AudioModule | null = null;
+
+type AudioDeviceSettings = {
+    type: string;
+    input: string;
+    output: string;
+    sampleRate: string;
+    bufferSize: string;
+    inputChannel: string;
+    monitorMute?: boolean;
+    savedAt?: number;
+};
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+    return Array.isArray(value) ? value.map(String) : [];
+}
+
+function normalizeNumberArray(value: unknown): number[] {
+    if (!Array.isArray(value)) return [];
+    return value.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+}
+
+function isSelectValue(value: unknown): boolean {
+    return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function normalizeSelectValue(value: unknown): string {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return '';
+}
+
+function normalizeDeviceSettings(settings: unknown): AudioDeviceSettings | null {
+    const record = asRecord(settings);
+    if (!record) return null;
+
+    const hasExpectedShape =
+        typeof record.type === 'string'
+        && typeof record.input === 'string'
+        && typeof record.output === 'string'
+        && isSelectValue(record.sampleRate)
+        && isSelectValue(record.bufferSize)
+        && isSelectValue(record.inputChannel);
+    if (!hasExpectedShape) return null;
+
+    const normalized: AudioDeviceSettings = {
+        type: typeof record.type === 'string' ? record.type : '',
+        input: typeof record.input === 'string' ? record.input : '',
+        output: typeof record.output === 'string' ? record.output : '',
+        sampleRate: normalizeSelectValue(record.sampleRate),
+        bufferSize: normalizeSelectValue(record.bufferSize),
+        inputChannel: normalizeSelectValue(record.inputChannel),
+    };
+    if (typeof record.monitorMute === 'boolean') {
+        normalized.monitorMute = record.monitorMute;
+    }
+    const savedAt = Number(record.savedAt);
+    if (Number.isFinite(savedAt) && savedAt > 0) {
+        normalized.savedAt = savedAt;
+    }
+    return normalized;
+}
+
+function normalizeDeviceOptions(options: unknown, fallback: { type: string; input: string; output: string; error?: string }) {
+    const record = asRecord(options);
+    return {
+        type: String(record?.type ?? fallback.type ?? ''),
+        input: String(record?.input ?? fallback.input ?? ''),
+        output: String(record?.output ?? fallback.output ?? ''),
+        inputChannels: normalizeStringArray(record?.inputChannels),
+        outputChannels: normalizeStringArray(record?.outputChannels),
+        sampleRates: normalizeNumberArray(record?.sampleRates),
+        bufferSizes: normalizeNumberArray(record?.bufferSizes),
+        error: String(record?.error ?? fallback.error ?? ''),
+    };
+}
+
+function getAudioSettingsPath(): string {
+    return path.join(app.getPath('userData'), 'slopsmith-audio-settings.json');
+}
+
+function readAudioSettings(): AudioDeviceSettings | null {
+    try {
+        const settingsPath = getAudioSettingsPath();
+        if (!fs.existsSync(settingsPath)) return null;
+        return normalizeDeviceSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf-8')));
+    } catch (e: any) {
+        console.warn(`[audio] Failed to read audio settings: ${e.message}`);
+        return null;
+    }
+}
+
+function writeAudioSettings(settings: unknown): boolean {
+    const normalized = normalizeDeviceSettings(settings);
+    if (!normalized) return false;
+    try {
+        const settingsPath = getAudioSettingsPath();
+        fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+        fs.writeFileSync(settingsPath, JSON.stringify(normalized, null, 2), 'utf-8');
+        return true;
+    } catch (e: any) {
+        console.warn(`[audio] Failed to write audio settings: ${e.message}`);
+        return false;
+    }
+}
 
 // slotId → VST3 path, populated by audio:loadVST. Lets audio:openPluginEditor
 // resolve a slot's plugin path for the crash sentinel without a native
@@ -130,14 +240,15 @@ export function initAudioBridge(): void {
     });
 
     ipcMain.handle('audio:probeDeviceOptions', (_event, typeName: string, input: string, output: string) => {
-        return audio?.probeDeviceOptions(typeName, input, output) ?? {
+        const options = audio && typeof audio.probeDeviceOptions === 'function'
+            ? audio.probeDeviceOptions(typeName, input, output)
+            : null;
+        return normalizeDeviceOptions(options, {
             type: String(typeName || ''),
             input: String(input || ''),
             output: String(output || ''),
-            sampleRates: [],
-            bufferSizes: [],
             error: 'Native audio addon not available',
-        };
+        });
     });
 
     ipcMain.handle('audio:getCurrentDevice', () => {
@@ -151,6 +262,10 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:setDevice', (_event, input: string, output: string, sampleRate: number, bufferSize: number) => {
         return audio?.setDevice(input, output, sampleRate, bufferSize) ?? false;
     });
+
+    ipcMain.handle('audio:loadDeviceSettings', () => readAudioSettings());
+
+    ipcMain.handle('audio:saveDeviceSettings', (_event, settings: unknown) => writeAudioSettings(settings));
 
     // ── Audio Control ──────────────────────────────────────────────────────
 
@@ -366,18 +481,18 @@ export function initAudioBridge(): void {
 
     // ── Signal Chain ───────────────────────────────────────────────────────
 
-    ipcMain.handle('audio:loadVST', (_event, pluginPath: string) => {
-        // Bracket the in-process load with the crash sentinel. The sentinel
-        // detects a hard process abort: loadVST is synchronous, so a fault
-        // means this call never returns and the `finally` never runs, leaving
-        // the sentinel for the next startup to find. Any normal return OR a
-        // thrown JS exception (loadVST throws on a required-sandbox spawn
-        // failure — a clean error, not a crash) means the process survived,
-        // so disarm in `finally` to avoid a false blocklist entry.
+    ipcMain.handle('audio:loadVST', async (_event, pluginPath: string) => {
+        // Bracket the in-process load with the crash sentinel. The native
+        // loadVST is now a Napi::AsyncWorker that returns a Promise<number>;
+        // a hard abort during the load means the awaiting handler never
+        // resumes and the sentinel survives for the next startup. Any
+        // normal resolve OR a thrown JS exception (the worker rejects on a
+        // required-sandbox spawn failure) means the process survived, so
+        // disarm in `finally` to avoid a false blocklist entry.
         armSentinel(pluginPath, 'load');
         let slotId = -1;
         try {
-            slotId = audio?.loadVST(pluginPath) ?? -1;
+            slotId = (await audio?.loadVST(pluginPath)) ?? -1;
         } finally {
             disarmSentinel();
         }

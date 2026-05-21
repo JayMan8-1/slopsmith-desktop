@@ -71,9 +71,19 @@ if(WIN32)
 
     if(MSVC)
         # /EHa for SEH-aware catch in VSTHost.cpp (matches src/audio/CMakeLists.txt).
-        # add_executable(... WIN32 ...) already implies /SUBSYSTEM:WINDOWS and
-        # the matching entry point.
         target_compile_options(slopsmith-vst-host PRIVATE /EHa)
+        # Emit a PDB for Release builds so sandbox-child crash dumps can be
+        # symbolised — see the matching block in src/audio/CMakeLists.txt for the
+        # /Zi + /DEBUG:FULL + /OPT rationale.
+        target_compile_options(slopsmith-vst-host PRIVATE $<$<CONFIG:Release>:/Zi>)
+        # One generator expression per flag — see src/audio/CMakeLists.txt.
+        target_link_options(slopsmith-vst-host PRIVATE
+            $<$<CONFIG:Release>:/DEBUG:FULL>
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>)
+        # `add_executable(... WIN32 ...)` already implies /SUBSYSTEM:WINDOWS and
+        # the matching entry point (WinMainCRTStartup, or wWinMainCRTStartup if
+        # the toolchain ever picks up _UNICODE). No need to pin them explicitly.
     endif()
 endif()
 

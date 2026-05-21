@@ -1,6 +1,6 @@
 {
   "name": "slopsmith-desktop",
-  "version": "0.2.8",
+  "version": "0.2.9-alpha.1",
   "description": "Slopsmith desktop app with integrated audio engine, VST hosting, and amp modeling",
   "author": {
     "name": "Byron",
@@ -93,8 +93,7 @@
     },
     "mac": {
       "target": [
-        "dmg",
-        "zip"
+        "dir"
       ],
       "category": "public.app-category.music",
       "icon": "resources/icons/icon.icns",
@@ -115,7 +114,7 @@
     },
     "win": {
       "target": [
-        "nsis"
+        "dir"
       ],
       "icon": "resources/icons/icon.ico",
       "files": [
@@ -124,15 +123,12 @@
       "asarUnpack": [
         "build/Release/slopsmith-vst-host.exe"
       ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
     }
   },
   "dependencies": {
     "lottie-web": "^5.13.0",
-    "node-addon-api": "^8.3.1"
+    "node-addon-api": "^8.3.1",
+    "velopack": "0.0.1589-ga2c5a97"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
