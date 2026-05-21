@@ -2174,8 +2174,9 @@ static Napi::Value LoadPreset(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
+    auto liveEngine = snapshotEngine();
 
-    if (!snapshotEngine() || info.Length() < 1) {
+    if (!liveEngine || info.Length() < 1) {
         auto obj = Napi::Object::New(env);
         obj.Set("success", false);
         obj.Set("error", "No engine or missing argument");
