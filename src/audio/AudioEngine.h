@@ -47,6 +47,8 @@ public:
         juce::String type;
         juce::String input;
         juce::String output;
+        juce::StringArray inputChannels;
+        juce::StringArray outputChannels;
         juce::Array<double> sampleRates;
         juce::Array<int> bufferSizes;
         juce::String error;
