@@ -426,6 +426,7 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
 {
     const juce::ScopedLock sl(backingLock);
     stopBackingNoLock();
+    backingResampler.reset();
     backingTransport.reset();
     backingSource.reset();
 
@@ -508,6 +509,11 @@ void AudioEngine::stopBacking()
 
 void AudioEngine::setBackingSpeed(double speed)
 {
+    if (!std::isfinite(speed) || speed <= 0.0)
+    {
+        return;
+    }
+
     backingSpeed.store(speed);
     const juce::ScopedLock sl(backingLock);
     if (backingResampler)
