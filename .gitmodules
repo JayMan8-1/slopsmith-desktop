@@ -13,6 +13,8 @@
 [submodule "src/audio/third_party/signalsmith-stretch"]
 	path = src/audio/third_party/signalsmith-stretch
 	url = https://github.com/Signalsmith-Audio/signalsmith-stretch.git
+	branch = main
 [submodule "src/audio/third_party/signalsmith-linear"]
 	path = src/audio/third_party/signalsmith-linear
 	url = https://github.com/Signalsmith-Audio/linear.git
+	branch = main

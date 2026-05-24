@@ -860,8 +860,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
             // Stretch always outputs 2 channels, the mix-down loop uses jmin to handle
             // mono or multi-channel device configs.
-            backingBuffer.setSize(2, numSamples, false, false, true);
-            backingBuffer.clear();
+            backingBuffer.clear(0, numSamples);
 
             const float* const* inPtrs  = backingInputBuffer.getArrayOfReadPointers();
             float* const* outPtrs = backingBuffer.getArrayOfWritePointers();
