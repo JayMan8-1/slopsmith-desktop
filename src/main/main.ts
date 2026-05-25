@@ -63,13 +63,15 @@ import * as path from 'path';
 // access violations) into <userData>/Crashpad/reports/ as .dmp files. Must
 // run before app.whenReady(). uploadToServer:false keeps dumps local — they
 // can be inspected with WinDbg / minidump-stackwalk.
-crashReporter.start({
-    productName: 'slopsmith-desktop',
-    companyName: 'slopsmith',
-    submitURL: '',
-    uploadToServer: false,
-    compress: false,
-});
+if (crashReporter?.start) {
+    crashReporter.start({
+        productName: 'slopsmith-desktop',
+        companyName: 'slopsmith',
+        submitURL: '',
+        uploadToServer: false,
+        compress: false,
+    });
+}
 import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
 import {
     IPC_STARTUP_STATUS,

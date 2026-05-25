@@ -1,4 +1,5 @@
 #pragma once
+#include "BackingTimeStretch.h"
 #include "NoiseGate.h"
 #include "TonePolish.h"
 #include "SignalChain.h"
@@ -198,6 +199,7 @@ private:
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
     void audioDeviceStopped() override;
     void stopBackingNoLock(); // stop transport without acquiring backingLock (caller holds it)
+    void updateBackingResamplerRatio(); // reader SR → device SR (tempo handled by SoundTouch)
 
     // ML-backed chord scoring against the MlNoteDetector's active-pitch set.
     // Used by scoreChord() when a Basic Pitch model is loaded.
@@ -233,7 +235,9 @@ private:
     std::unique_ptr<juce::AudioFormatReaderSource> backingSource;
     std::unique_ptr<juce::AudioTransportSource> backingTransport;
     std::unique_ptr<juce::ResamplingAudioSource> backingResampler;
+    BackingTimeStretch backingStretch;
     juce::AudioBuffer<float> backingBuffer;
+    std::atomic<double> backingReaderSampleRate{44100.0};
     std::atomic<bool> backingPlaying{false};
     std::atomic<double> cachedBackingPosition{0.0};
     std::atomic<double> cachedBackingDuration{0.0};

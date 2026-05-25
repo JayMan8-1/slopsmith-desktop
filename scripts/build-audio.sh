@@ -18,6 +18,13 @@ if [ ! -f "JUCE/CMakeLists.txt" ]; then
     git submodule update --init --recursive
 fi
 
+# SoundTouch (LGPL) — preserve-pitch backing-track slowdown
+SOUNDTOUCH_DIR="$PROJECT_DIR/src/audio/third_party/soundtouch"
+if [ ! -f "$SOUNDTOUCH_DIR/include/SoundTouch.h" ]; then
+    echo "Fetching SoundTouch into src/audio/third_party/soundtouch ..."
+    git clone --depth 1 https://codeberg.org/soundtouch/soundtouch.git "$SOUNDTOUCH_DIR"
+fi
+
 # Ensure node_modules exist (for node-addon-api headers)
 if [ ! -d "node_modules" ]; then
     echo "Installing npm dependencies..."
