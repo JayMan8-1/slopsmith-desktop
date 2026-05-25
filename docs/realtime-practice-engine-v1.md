@@ -53,4 +53,11 @@ Future upgrades (not V1): Rubber Band, offline stretch cache, spectral/transient
 
 ## Milestone
 
-Tag: **`v1-realtime-practice-engine`** (paired with `slopsmith` UI commit).
+- Tag: **`v1-realtime-practice-engine`**
+- Paired UI commit: same tag in `slopsmith`
+- Full spec (player UX): `slopsmith/docs/realtime-practice-engine-v1.md`
+
+## What ships next (V1.1+)
+
+Section practice and loop workflow in the web player; native transport stays unchanged.
+Planning: `slopsmith/docs/loop-section-practice-plan.md`.
