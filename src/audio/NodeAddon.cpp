@@ -2064,8 +2064,8 @@ static Napi::Value SetBackingSpeed(const Napi::CallbackInfo& info)
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    if (engine)
-        engine->setBackingSpeed(info[0].As<Napi::Number>().DoubleValue());
+    if (auto liveEngine = snapshotEngine())
+        liveEngine->setBackingSpeed(info[0].As<Napi::Number>().DoubleValue());
     return env.Undefined();
 }
 
@@ -2078,8 +2078,8 @@ static Napi::Value SetBackingPreservePitch(const Napi::CallbackInfo& info)
             .ThrowAsJavaScriptException();
         return env.Undefined();
     }
-    if (engine)
-        engine->setBackingPreservePitch(info[0].As<Napi::Boolean>().Value());
+    if (auto liveEngine = snapshotEngine())
+        liveEngine->setBackingPreservePitch(info[0].As<Napi::Boolean>().Value());
     return env.Undefined();
 }
 

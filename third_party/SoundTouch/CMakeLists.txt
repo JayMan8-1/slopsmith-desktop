@@ -93,7 +93,6 @@ install(
     include/FIFOSamplePipe.h
     include/STTypes.h
     include/SoundTouch.h
-    include/soundtouch_config.h
   DESTINATION
     "${CMAKE_INSTALL_INCLUDEDIR}/soundtouch"
 )
