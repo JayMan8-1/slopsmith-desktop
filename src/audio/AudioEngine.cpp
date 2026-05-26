@@ -526,15 +526,24 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     // The 4th arg makes AudioTransportSource SRC the file to device rate.
     // Stretch always sees device-rate audio so that its presetDefault parameters match.
     backingTransport->setSource(backingSource.get(), 0, nullptr, readerSampleRate);
-    backingTransport->prepareToPlay(bs, sr);
 
-    backingStretch.presetDefault(2, (float) sr);
-    backingStretch.reset();
-    backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
+    // Loading a backing track before the audio device has started leaves
+    // sr/bs at zero. presetDefault(2, 0.0f) would seed the stretcher with
+    // undefined internal timing, and prepareToPlay(0, 0) is similarly
+    // ill-defined. Defer the stretcher + buffer setup; audioDeviceAboutToStart()
+    // re-runs the same block once a real sample rate / block size are known.
+    if (sr > 0.0 && bs > 0)
+    {
+        backingTransport->prepareToPlay(bs, sr);
 
-    const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
-    backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
-    backingBuffer.setSize(2, bs, false, false, true);
+        backingStretch.presetDefault(2, (float) sr);
+        backingStretch.reset();
+        backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
+
+        const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
+        backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
+        backingBuffer.setSize(2, bs, false, false, true);
+    }
 
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
     cachedBackingPosition.store(0.0);
