@@ -605,10 +605,8 @@ void AudioEngine::setBackingSpeed(double speed)
     const juce::ScopedLock sl(backingLock);
     backingSpeed.store(speed);
     updateBackingResamplerRatio();
+    // Do not reset/flush on speed-only changes — preserves WSOLA overlap continuity.
     backingStretch.setTempo(speed);
-    backingStretch.reset();
-    if (backingResampler)
-        backingResampler->flushBuffers();
     std::cerr << "[AudioEngine] setBackingSpeed(" << speed << ") timestretch="
               << (backingStretch.isBypassed() ? "bypassed" : "active") << std::endl;
 }
