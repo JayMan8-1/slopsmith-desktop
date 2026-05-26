@@ -852,7 +852,17 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (sl.isLocked() && backingTransport && backingPlaying.load())
         {
             const double rate = juce::jlimit(0.01, kMaxBackingSpeed, backingSpeed.load(std::memory_order_relaxed));
-            const int inputFrames = (int) std::ceil(numSamples * rate);
+
+            // Defensive clamp: the buffers are sized in audioDeviceAboutToStart()
+            // from the device's nominal block size, but the callback can deliver
+            // a larger numSamples on a device-reconfig race. Drop the excess
+            // frames silently rather than reading/writing past the allocated
+            // span. This avoids realloc on the RT thread; the next callback
+            // after reconfig will arrive at the new nominal size.
+            const int outCap = backingBuffer.getNumSamples();
+            const int inCap  = backingInputBuffer.getNumSamples();
+            const int outSamples = juce::jmin(numSamples, outCap);
+            const int inputFrames = juce::jmin((int) std::ceil(outSamples * rate), inCap);
 
             backingInputBuffer.clear(0, inputFrames);
             juce::AudioSourceChannelInfo info(&backingInputBuffer, 0, inputFrames);
@@ -860,11 +870,11 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
             // Stretch always outputs 2 channels, the mix-down loop uses jmin to handle
             // mono or multi-channel device configs.
-            backingBuffer.clear(0, numSamples);
+            backingBuffer.clear(0, outSamples);
 
             const float* const* inPtrs  = backingInputBuffer.getArrayOfReadPointers();
             float* const* outPtrs = backingBuffer.getArrayOfWritePointers();
-            backingStretch.process(inPtrs, inputFrames, outPtrs, numSamples);
+            backingStretch.process(inPtrs, inputFrames, outPtrs, outSamples);
 
             // Report the song position when audible at the speakers:
             // subtract the stretcher's output latency converted to input-time seconds.
@@ -882,7 +892,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             float bVol = backingVolume.load();
             const int mixChannels = juce::jmin(numOutputChannels, 2);
             for (int ch = 0; ch < mixChannels; ++ch)
-                buffer.addFrom(ch, 0, backingBuffer, ch, 0, numSamples, bVol);
+                buffer.addFrom(ch, 0, backingBuffer, ch, 0, outSamples, bVol);
         }
     }
 
