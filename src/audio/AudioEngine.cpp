@@ -534,13 +534,19 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     // re-runs the same block once a real sample rate / block size are known.
     if (sr > 0.0 && bs > 0)
     {
-        backingTransport->prepareToPlay(bs, sr);
+        // prepareToPlay's first arg is an upper bound on subsequent
+        // getNextAudioBlock requests, per the juce::AudioSource contract.
+        // The RT callback can pull ceil(bs * kMaxBackingSpeed) frames in a
+        // single block when the speed is above 1×, so prepare for that
+        // worst case — preparing with just `bs` would risk JUCE internal
+        // buffer overruns/asserts on the first faster-than-1× block.
+        const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
+        backingTransport->prepareToPlay(maxInputFrames, sr);
 
         backingStretch.presetDefault(2, (float) sr);
         backingStretch.reset();
         backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
 
-        const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
         backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
         backingBuffer.setSize(2, bs, false, false, true);
     }
@@ -598,7 +604,11 @@ void AudioEngine::setBackingSpeed(double speed)
         return;
     }
 
-    backingSpeed.store(speed, std::memory_order_relaxed);
+    // Clamp to the same range the RT callback would enforce so the stored
+    // value is authoritative — callers that ask for 10× get 4× recorded
+    // instead of having the API silently disagree with playback behaviour.
+    backingSpeed.store(juce::jlimit(0.01, kMaxBackingSpeed, speed),
+                       std::memory_order_relaxed);
 }
 
 void AudioEngine::resetPeaks()
@@ -651,11 +661,14 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     const juce::ScopedLock sl(backingLock);
     if (backingTransport)
     {
-        backingTransport->prepareToPlay(bs, sr);
+        // See loadBackingTrack() for why prepareToPlay uses maxInputFrames
+        // rather than bs: the RT callback can pull ceil(bs * kMaxBackingSpeed)
+        // frames in a single block at faster-than-1× speeds.
+        const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
+        backingTransport->prepareToPlay(maxInputFrames, sr);
         backingStretch.presetDefault(2, (float) sr);
         backingStretch.reset();
         backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
-        const int maxInputFrames = (int) std::ceil(bs * kMaxBackingSpeed) + 64;
         backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
         backingBuffer.setSize(2, bs, false, false, true);
     }
