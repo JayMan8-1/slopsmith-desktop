@@ -97,7 +97,10 @@ void BackingTimeStretch::applyProfileForTempo(double tempoIn)
     stretch.clear();
     clearDryFifo();
     applyStretchProfile(stretch, desired);
-    stretch.setTempo(static_cast<float>(activeStretchTempo));
+    // Profile geometry changed — snap tempo so SoundTouch does not stay at the old
+    // active value (often 1.0) while target is already at a practice slowdown.
+    activeStretchTempo = targetTempo;
+    stretch.setTempo(static_cast<float>(targetTempo));
 
     const char* name = nearUnityProfileActive ? "near-unity" : "deep";
     std::cerr << "[AudioEngine] SoundTouch profile: " << name
@@ -212,10 +215,62 @@ void BackingTimeStretch::setTempo(double newTempo)
     const double prevTarget = targetTempo;
     targetTempo = newTempo;
     applyProfileForTempo(targetTempo);
+    activeStretchTempo = targetTempo;
+    stretch.setTempo(static_cast<float>(targetTempo));
 
     if (std::abs(prevTarget - targetTempo) > 0.001)
+    {
+        if (diagPendingSpeedSummary && diagCallbackCount > 0)
+            flushSpeedDiagnostics(diagTransportStartSec);
+
         std::cerr << "[AudioEngine] setTempo target=" << targetTempo
                   << " active=" << activeStretchTempo << std::endl;
+        markSpeedChangeForDiagnostics();
+    }
+}
+
+void BackingTimeStretch::markSpeedChangeForDiagnostics()
+{
+    diagPendingSpeedSummary = true;
+    diagCallbackCount = 0;
+    diagRequestedOutFrames = 0;
+    diagSourceFramesPulled = 0;
+    diagStretchReceived = 0;
+    diagStretchReadyMax = 0;
+    diagTransportStartValid = false;
+}
+
+void BackingTimeStretch::flushSpeedDiagnostics(double transportPositionSec)
+{
+    if (!diagPendingSpeedSummary || diagCallbackCount == 0)
+        return;
+
+    const double transportDelta = diagTransportStartValid
+                                    ? transportPositionSec - diagTransportStartSec
+                                    : 0.0;
+    const char* pathName = "unknown";
+    switch (lastOutputPath)
+    {
+        case StretchOutputPath::Bypass: pathName = "bypass"; break;
+        case StretchOutputPath::Stretched: pathName = "stretched"; break;
+        case StretchOutputPath::StretchedPartial: pathName = "stretched-partial"; break;
+        case StretchOutputPath::Silence: pathName = "silence"; break;
+    }
+
+    const double callbacks = static_cast<double>(diagCallbackCount);
+    std::cerr << "[AudioEngine] stretchDiag speedSummary"
+              << " target=" << targetTempo
+              << " active=" << activeStretchTempo
+              << " callbacks=" << diagCallbackCount
+              << " avgReqOut=" << (static_cast<double>(diagRequestedOutFrames) / callbacks)
+              << " avgSrcPulled=" << (static_cast<double>(diagSourceFramesPulled) / callbacks)
+              << " avgStretchRecv=" << (static_cast<double>(diagStretchReceived) / callbacks)
+              << " maxStretchReady=" << diagStretchReadyMax
+              << " transportDeltaSec=" << transportDelta
+              << " lastPath=" << pathName
+              << std::endl;
+
+    diagPendingSpeedSummary = false;
 }
 
 bool BackingTimeStretch::isBypassed() const
@@ -261,54 +316,77 @@ void BackingTimeStretch::process(juce::ResamplingAudioSource& resampler,
     if (numSamples <= 0)
         return;
 
+    const double transportPos = transport.getCurrentPosition();
+    if (diagPendingSpeedSummary && !diagTransportStartValid)
+    {
+        diagTransportStartSec = transportPos;
+        diagTransportStartValid = true;
+    }
+
     if (isBypassed())
     {
         juce::AudioSourceChannelInfo info(&dest, 0, numSamples);
         resampler.getNextAudioBlock(info);
-        heardPositionSec = transport.getCurrentPosition();
+        heardPositionSec = transportPos;
+        lastOutputPath = StretchOutputPath::Bypass;
+        if (diagPendingSpeedSummary)
+        {
+            ++diagCallbackCount;
+            diagRequestedOutFrames += static_cast<uint64_t>(numSamples);
+            diagSourceFramesPulled += static_cast<uint64_t>(numSamples);
+            diagStretchReceived += static_cast<uint64_t>(numSamples);
+        }
         return;
     }
 
     advanceTempoRamp(numSamples);
 
-    const double feedTempo = juce::jmax(0.01, activeStretchTempo);
+    const double stretchTempo = juce::jmax(0.01, activeStretchTempo);
     const float dryMix = static_cast<float>(nearUnityDryBlend(targetTempo));
     const float wetMix = 1.0f - dryMix;
-    int outFrames = 0;
-    const int maxFeedPerLoop = juce::jmax(64, maxBlockSize);
-    int idleFeeds = 0;
+    int sourceFramesPulled = 0;
+    int stretchFramesReceived = 0;
+    uint stretchReadyMax = stretch.numSamples();
+    const int maxSrcPull = maxBlockSize * 2;
+    int feedIdle = 0;
 
-    while (outFrames < numSamples)
+    // Feed source only while stretched output buffered for this block is short.
+    // SoundTouch output rate = input rate / tempo, so source frames needed ≈
+    // outputDeficit * tempo. Do not pull from the resampler when ready already
+    // covers the full callback — that was advancing transport at ~1x.
+    while (stretch.numSamples() < static_cast<uint>(numSamples))
     {
-        const uint ready = stretch.numSamples();
-        if (ready < static_cast<uint>(numSamples - outFrames))
-        {
-            if (!transport.isPlaying())
-                break;
+        if (!transport.isPlaying())
+            break;
 
-            const int deficit = numSamples - outFrames;
-            const int toPull = juce::jlimit(
-                64,
-                maxFeedPerLoop,
-                static_cast<int>(std::ceil(static_cast<double>(deficit) * feedTempo * 1.5)) + 32);
-            pullFromResampler(resampler, toPull);
-            ++idleFeeds;
-            if (stretch.numSamples() == ready && idleFeeds > 8)
+        const uint ready = stretch.numSamples();
+        stretchReadyMax = juce::jmax(stretchReadyMax, ready);
+        const int outDeficit = numSamples - static_cast<int>(ready);
+        const int srcToPull = juce::jlimit(
+            1,
+            maxSrcPull,
+            static_cast<int>(std::ceil(static_cast<double>(outDeficit) * stretchTempo)));
+
+        sourceFramesPulled += pullFromResampler(resampler, srcToPull);
+
+        const uint readyAfter = stretch.numSamples();
+        if (readyAfter <= ready)
+        {
+            if (++feedIdle > 12)
                 break;
         }
         else
         {
-            idleFeeds = 0;
+            feedIdle = 0;
         }
+    }
 
-        if ((int) interleavedOut.size() < (numSamples - outFrames) * 2)
-            interleavedOut.resize(static_cast<size_t>(numSamples - outFrames) * 2u);
+    stretchReadyMax = juce::jmax(stretchReadyMax, stretch.numSamples());
 
-        const uint maxRecv = static_cast<uint>(numSamples - outFrames);
-        const uint received = stretch.receiveSamples(interleavedOut.data(), maxRecv);
-        if (received == 0)
-            break;
+    if ((int) interleavedOut.size() < numSamples * 2)
+        interleavedOut.resize(static_cast<size_t>(numSamples) * 2u);
 
+    auto copyStretchToDest = [&](uint received, int destOffset) {
         for (uint i = 0; i < received; ++i)
         {
             float wetL = interleavedOut[static_cast<size_t>(i) * 2u];
@@ -320,12 +398,34 @@ void BackingTimeStretch::process(juce::ResamplingAudioSource& resampler,
                 wetL = wetMix * wetL + dryMix * dry[0];
                 wetR = wetMix * wetR + dryMix * dry[1];
             }
-            const int idx = outFrames + static_cast<int>(i);
+            const int idx = destOffset + static_cast<int>(i);
             dest.setSample(0, idx, wetL);
             if (dest.getNumChannels() > 1)
                 dest.setSample(1, idx, wetR);
         }
-        outFrames += static_cast<int>(received);
+    };
+
+    uint received = stretch.receiveSamples(interleavedOut.data(),
+                                           static_cast<uint>(numSamples));
+    copyStretchToDest(received, 0);
+    int outFrames = static_cast<int>(received);
+    stretchFramesReceived = outFrames;
+
+    // One recovery feed+receive if still short while transport is playing.
+    if (outFrames < numSamples && transport.isPlaying())
+    {
+        const int remain = numSamples - outFrames;
+        const int srcToPull = juce::jlimit(
+            1,
+            maxSrcPull,
+            static_cast<int>(std::ceil(static_cast<double>(remain) * stretchTempo)));
+        sourceFramesPulled += pullFromResampler(resampler, srcToPull);
+
+        const uint more = stretch.receiveSamples(interleavedOut.data(),
+                                                 static_cast<uint>(remain));
+        copyStretchToDest(more, outFrames);
+        outFrames += static_cast<int>(more);
+        stretchFramesReceived = outFrames;
     }
 
     if (outFrames < numSamples)
@@ -334,5 +434,27 @@ void BackingTimeStretch::process(juce::ResamplingAudioSource& resampler,
     if (outFrames > 0)
         applyPracticeSmoothing(dest, outFrames);
 
-    heardPositionSec += (static_cast<double>(outFrames) / sampleRate) * feedTempo;
+    // Heard position follows stretched output (musical time), not transport read head.
+    heardPositionSec += (static_cast<double>(outFrames) / sampleRate) * stretchTempo;
+
+    if (outFrames <= 0)
+        lastOutputPath = StretchOutputPath::Silence;
+    else if (outFrames < numSamples)
+        lastOutputPath = StretchOutputPath::StretchedPartial;
+    else
+        lastOutputPath = StretchOutputPath::Stretched;
+
+    if (diagPendingSpeedSummary)
+    {
+        ++diagCallbackCount;
+        diagRequestedOutFrames += static_cast<uint64_t>(numSamples);
+        diagSourceFramesPulled += static_cast<uint64_t>(sourceFramesPulled);
+        diagStretchReceived += static_cast<uint64_t>(stretchFramesReceived);
+        diagStretchReadyMax =
+            juce::jmax<uint64_t>(diagStretchReadyMax,
+                                 static_cast<uint64_t>(stretchReadyMax));
+
+        if (diagCallbackCount >= 480)
+            flushSpeedDiagnostics(transport.getCurrentPosition());
+    }
 }
