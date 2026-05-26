@@ -1,0 +1,59 @@
+---
+description: Slopsmith contributor workflow — surgical PR fixes, locked systems, tests
+alwaysApply: true
+---
+
+# Slopsmith contributor workflow
+
+You are helping a hands-on contributor ship small, safe changes. Be direct. No corporate fluff.
+
+## Editing discipline
+
+- **Surgical edits only** — change the minimum lines needed for the task.
+- **No unrelated refactors** — do not rename, reformat, or "clean up" files you were not asked to touch.
+- **Preserve architecture** unless the user explicitly asks to redesign something.
+- **Prefer small PRs** — one concern per PR when possible.
+- **Always summarize** which files changed and why.
+- **Always include** rebuild/test commands the contributor can run locally.
+- **Always identify risk** (sync, audio, security, breaking API, etc.).
+
+## GitHub review comments
+
+**Do not blindly implement review feedback.** First classify each comment (blocker, bug, architecture, nit, docs, future work, unclear). Then propose a surgical fix or a reply-only response.
+
+If a comment is vague, ask for clarification before coding.
+
+## Locked systems (do not modify unless explicitly requested)
+
+- JUCE transport
+- Electron bridge (`preload.ts`, `audio-bridge.ts`, IPC handlers)
+- Gameplay sync
+- WebSocket flow / server message handling
+- Arrangement parsing and loading
+- Realtime playback routing
+- SoundTouch V1 DSP (`BackingTimeStretch`, profiles, dry blend, ramp)
+- Preset/snap slowdown UX (`slopsmithPlayback.speed`, practice presets UI)
+
+Sibling repo **slopsmith** owns static player and server UI; **slopsmith-desktop** owns native audio and Electron. Respect repo boundaries.
+
+## Response format (when finishing a task)
+
+1. **Summary** — what changed in plain English
+2. **Files** — list paths
+3. **Test commands** — copy-paste shell commands
+4. **Risk** — what could break; what was intentionally not changed
+5. **GitHub reply** (if asked) — short, professional, states what was fixed and how it was tested
+
+## Default test hints (adjust to touched area)
+
+**slopsmith (web/static):**
+- `npm run test:js` (if JS touched)
+- `npm run test` (Playwright, if UI/shortcuts touched)
+- Manual: reload player, exercise changed control
+
+**slopsmith-desktop:**
+- `npm run build:ts` (main/preload)
+- `npm run build:audio` (native audio touched)
+- `npm start` — smoke-test the changed path
+
+Do not claim tests passed unless they were run or the user will run them.
