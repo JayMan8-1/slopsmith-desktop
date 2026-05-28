@@ -1276,8 +1276,11 @@ void AudioEngine::setBackingSpeed(double speed)
     }
 
     // Reset stretch and re-anchor heard position before publishing the new rate.
-    // RT reads backingSpeed under tryLock; publishing early could process one block
-    // at the new rate with stale stretch state (CodeRabbit PR #237).
+    // backingLock serializes this whole reset+publish against the RT callback
+    // (which reads backingSpeed only while holding the same lock via tryLock),
+    // so the RT thread can never observe the new rate with stale stretch state
+    // (CodeRabbit PR #237). The lock's acquire/release provides that ordering,
+    // so the store itself can be relaxed.
     const juce::ScopedLock sl(backingLock);
     if (backingTransport)
     {
@@ -1286,7 +1289,7 @@ void AudioEngine::setBackingSpeed(double speed)
         backingHeardPositionSec.store(pos, std::memory_order_relaxed);
     }
 
-    backingSpeed.store(clamped, std::memory_order_release);
+    backingSpeed.store(clamped, std::memory_order_relaxed);
 
     std::cerr << "[AudioEngine] setBackingSpeed(" << clamped << ") stretch reset"
               << std::endl;
