@@ -1299,18 +1299,18 @@ void AudioEngine::resetPeaks()
 int AudioEngine::renderBackingBlockLocked(int numSamples)
 {
     // Adopt any speed change requested since the last block (set lock-free by
-    // setBackingSpeed). compare_exchange (true->false) only writes the flag on
-    // the rare block that actually consumes a change; the common no-change path
-    // is a non-writing failed CAS, so the cache line isn't dirtied/bounced to
-    // this core on every callback. Acquire pairs with the release-store in
-    // setBackingSpeed so the new rate is visible here. Reset the stretcher and
-    // re-anchor the heard position in the SAME block we adopt the rate, so a
-    // block is never processed at the new rate with stale stretch state.
-    // reset() only clears state (no allocation), so it is safe on the audio thread.
-    bool changePending = true;
-    if (backingSpeedChangePending.compare_exchange_strong(
-            changePending, false, std::memory_order_acquire, std::memory_order_relaxed))
+    // setBackingSpeed). Common (no-change) path is a plain acquire load — no
+    // locked RMW, so the flag's cache line stays shared and isn't bounced to
+    // this core every callback. Only the rare block that actually consumes a
+    // change does the exchange (clearing the flag atomically so a concurrent
+    // setBackingSpeed can't lose an update). The acquire pairs with the
+    // release-store in setBackingSpeed so the new rate is visible here. Reset
+    // the stretcher and re-anchor the heard position in the SAME block we adopt
+    // the rate, so a block is never processed at the new rate with stale stretch
+    // state. reset() only clears state (no allocation), so it's audio-thread safe.
+    if (backingSpeedChangePending.load(std::memory_order_acquire))
     {
+        backingSpeedChangePending.exchange(false, std::memory_order_acquire);
         backingSpeed.store(juce::jlimit(0.01, kMaxBackingSpeed,
                                         backingPendingSpeed.load(std::memory_order_relaxed)),
                            std::memory_order_relaxed);
