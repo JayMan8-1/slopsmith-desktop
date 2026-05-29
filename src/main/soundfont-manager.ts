@@ -30,6 +30,10 @@ export type SoundfontQuality = 'default' | 'high';
 
 interface DesktopConfig {
     soundfontQuality?: SoundfontQuality;
+    // When true, the Python backend binds 0.0.0.0 (LAN-reachable) instead of
+    // 127.0.0.1, so other devices on the network can reach the library / sync
+    // room. Opt-in (default loopback) — see python.ts and issue #441.
+    lanAccess?: boolean;
 }
 
 function configPath(): string {

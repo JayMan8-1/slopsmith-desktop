@@ -14,6 +14,23 @@
         <div id="pm-install-msg" class="mt-2 text-sm hidden"></div>
     </div>
 
+    <!-- Network sharing (LAN access) -->
+    <div class="mb-6 p-4 rounded-lg bg-slate-800/50">
+        <h3 class="text-sm font-semibold mb-2 text-slate-300">Network sharing</h3>
+        <label class="flex items-start gap-3 cursor-pointer">
+            <input type="checkbox" id="pm-lan-toggle" class="mt-1 accent-emerald-500">
+            <span class="text-sm text-slate-300">
+                Allow access from other devices on my network
+                <span class="block text-xs text-slate-400 mt-0.5">
+                    Lets a phone or another computer on the same Wi-Fi reach this app's
+                    library and sync rooms. Off by default — only your own machine can
+                    connect. Toggling restarts the server.
+                </span>
+            </span>
+        </label>
+        <div id="pm-lan-status" class="mt-3 text-xs hidden"></div>
+    </div>
+
     <!-- Installed Plugins -->
     <div>
         <div class="flex items-center justify-between mb-3">

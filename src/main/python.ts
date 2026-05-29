@@ -8,7 +8,8 @@ import * as fs from 'fs';
 import { app } from 'electron';
 import * as http from 'http';
 import * as net from 'net';
-import { getActiveSoundfontPath } from './soundfont-manager';
+import * as os from 'os';
+import { getActiveSoundfontPath, getDesktopConfig } from './soundfont-manager';
 import { isDebugEnabled } from './debug-log';
 
 let pythonProcess: ChildProcess | null = null;
@@ -31,6 +32,31 @@ let startupComplete = false;
 
 export function getPythonPort(): number {
     return serverPort;
+}
+
+// Interface the backend binds. Default loopback (127.0.0.1); 0.0.0.0 (all
+// interfaces, LAN-reachable) only when the user opts in via the desktop
+// config's `lanAccess` flag. 0.0.0.0 still includes loopback, so the renderer
+// (which loads http://127.0.0.1:${port}) is unaffected either way. See #441.
+function getBindHost(): string {
+    return getDesktopConfig().lanAccess ? '0.0.0.0' : '127.0.0.1';
+}
+
+// LAN URLs the backend is reachable at when LAN access is enabled — the
+// machine's non-internal IPv4 addresses on the current server port. Used by
+// the desktop UI to tell the user where to point their phone/other device.
+// Returns [] when no external IPv4 interface is up.
+export function getLanUrls(): string[] {
+    const urls: string[] = [];
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+        for (const ni of ifaces[name] || []) {
+            if (ni.family === 'IPv4' && !ni.internal) {
+                urls.push(`http://${ni.address}:${serverPort}`);
+            }
+        }
+    }
+    return urls;
 }
 
 export interface StartupStatus {
@@ -96,9 +122,14 @@ function getJson(pathname: string, timeoutMs = 2000): Promise<unknown> {
 
 // Find an available port starting from 8000
 async function findPort(startPort: number): Promise<number> {
+    // Probe on the SAME interface the backend will bind (getBindHost): with
+    // LAN access on we bind 0.0.0.0, where a port can be free on loopback yet
+    // taken on another interface — a 127.0.0.1-only probe would call it free
+    // and uvicorn would then fail with EADDRINUSE. Found in Codex review.
+    const bindHost = getBindHost();
     return new Promise((resolve) => {
         const server = net.createServer();
-        server.listen(startPort, '127.0.0.1', () => {
+        server.listen(startPort, bindHost, () => {
             server.close(() => resolve(startPort));
         });
         server.on('error', () => {
@@ -178,12 +209,15 @@ function reapOrphanedPythonBackends(pythonPath: string): void {
     }
 }
 
-// True if the TCP port can be bound on 127.0.0.1 right now.
+// True if the TCP port can be bound right now on the interface the backend
+// will use (getBindHost) — loopback by default, 0.0.0.0 when LAN access is on,
+// so the free/busy answer matches what uvicorn will actually attempt.
 function isPortFree(port: number): Promise<boolean> {
+    const bindHost = getBindHost();
     return new Promise((resolve) => {
         const probe = net.createServer();
         probe.once('error', () => resolve(false));
-        probe.listen(port, '127.0.0.1', () => {
+        probe.listen(port, bindHost, () => {
             probe.close(() => resolve(true));
         });
     });
@@ -212,40 +246,47 @@ const PROBE_SPAWN: { encoding: BufferEncoding; timeout: number; windowsHide: boo
     encoding: 'utf8', timeout: 5000, windowsHide: true,
 };
 
-// Our backend is always launched as
-//   python -m uvicorn server:app --host 127.0.0.1 --port <p> …
-// Match on that full signature (not just the python image) so we never kill
-// an unrelated orphaned uvicorn `server:app` that happens to hold the port.
+// Our backend is launched as
+//   python -m uvicorn server:app --host <127.0.0.1|0.0.0.0> --port <p> …
+// The host depends on the LAN-access setting (getBindHost), so accept either
+// of our two signatures. Match on the full signature (not just the python
+// image) so we never kill an unrelated orphaned uvicorn `server:app` that
+// happens to hold the port.
 function isOurBackendCmd(cmd: string): boolean {
     return cmd.includes('uvicorn')
         && cmd.includes('server:app')
-        && cmd.includes('--host 127.0.0.1');
+        && (cmd.includes('--host 127.0.0.1') || cmd.includes('--host 0.0.0.0'));
 }
 
-// PIDs listening on the loopback interface (127.0.0.1 / ::1) at <port> — the
-// interface our backend binds (`uvicorn --host 127.0.0.1`). Cross-platform;
-// returns [] when the query tool is unavailable, hangs, or nothing is listening.
+// PIDs LISTENING at <port> on a local bind we might use — loopback
+// (127.0.0.1 / ::1) OR all-interfaces (0.0.0.0 / ::), since the backend binds
+// 0.0.0.0 when LAN access is enabled (see getBindHost). Cross-platform;
+// returns [] when the query tool is unavailable, hangs, or nothing is
+// listening. The caller (reclaimPort) only ever kills a PID that
+// `backendProcInfo` confirms is *our* uvicorn backend, so matching a
+// non-loopback listener here is safe — a stranger on the port is left alone.
 function findPidsOnPort(port: number): number[] {
     const pids = new Set<number>();
-    const isLoopback = (addr: string): boolean =>
-        addr === '127.0.0.1' || addr === '[::1]' || addr === '::1';
+    const isLocalBind = (addr: string): boolean =>
+        addr === '127.0.0.1' || addr === '[::1]' || addr === '::1'
+        || addr === '0.0.0.0' || addr === '[::]' || addr === '::' || addr === '*';
     if (process.platform === 'win32') {
         const out = spawnSync('netstat', ['-ano', '-p', 'tcp'], PROBE_SPAWN);
         if (out.error || typeof out.stdout !== 'string') return [];
         for (const line of out.stdout.split('\n')) {
             // Proto  Local Address        Foreign Address  State      PID
-            //  TCP   127.0.0.1:18000      0.0.0.0:0        LISTENING  1234
+            //  TCP   0.0.0.0:18000        0.0.0.0:0        LISTENING  1234
             const m = line.trim().match(/^TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
-            if (!m || Number(m[2]) !== port || !isLoopback(m[1])) continue;
+            if (!m || Number(m[2]) !== port || !isLocalBind(m[1])) continue;
             const pid = Number(m[3]);
             if (Number.isInteger(pid) && pid > 0) pids.add(pid);
         }
     } else {
-        // lsof ships with macOS and most Linux installs. Scope to loopback so
-        // we never match a listener on another interface.
-        for (const host of ['127.0.0.1', '[::1]']) {
-            const out = spawnSync('lsof', ['-nP', `-iTCP@${host}:${port}`, '-sTCP:LISTEN', '-t'], PROBE_SPAWN);
-            if (out.error || typeof out.stdout !== 'string') continue;
+        // lsof ships with macOS and most Linux installs. Query by port only
+        // (no @host) so it matches whether the holder bound loopback or
+        // 0.0.0.0 — the kill decision is gated on isOurBackendCmd downstream.
+        const out = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], PROBE_SPAWN);
+        if (!out.error && typeof out.stdout === 'string') {
             for (const tok of out.stdout.split(/\s+/)) {
                 const pid = Number(tok);
                 if (Number.isInteger(pid) && pid > 0) pids.add(pid);
@@ -619,9 +660,13 @@ export async function startPython(): Promise<void> {
         }
     }
 
+    const bindHost = getBindHost();
+    if (bindHost !== '127.0.0.1') {
+        console.log(`[python] LAN access enabled — binding ${bindHost} (reachable from other devices on the network)`);
+    }
     const child = spawn(pythonPath, [
         '-m', 'uvicorn', 'server:app',
-        '--host', '127.0.0.1',
+        '--host', bindHost,
         '--port', String(serverPort),
         '--no-access-log',
     ], {
