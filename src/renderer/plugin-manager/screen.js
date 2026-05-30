@@ -109,6 +109,64 @@
     // Refresh
     refreshBtn.addEventListener('click', refreshList);
 
+    // ── LAN access toggle ───────────────────────────────────────────────
+    const network = window.slopsmithDesktop?.network;
+    const lanToggle = $('pm-lan-toggle');
+    const lanStatus = $('pm-lan-status');
+
+    // Escape before interpolating into innerHTML — this renderer runs with
+    // webSecurity:false, and extraNote can carry a main-process error string.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+
+    function renderLanStatus(enabled, urls, extraNote) {
+        if (!lanStatus) return;
+        if (!enabled) {
+            lanStatus.className = 'mt-3 text-xs text-slate-500';
+            lanStatus.textContent = extraNote || 'Only this computer can connect.';
+            lanStatus.classList.remove('hidden');
+            return;
+        }
+        const list = (urls && urls.length)
+            ? urls.map((u) => `<li><code class="text-emerald-300">${esc(u)}</code></li>`).join('')
+            : '<li class="text-slate-400 italic">No network address detected — are you connected to Wi-Fi/Ethernet?</li>';
+        lanStatus.className = 'mt-3 text-xs text-slate-300';
+        lanStatus.innerHTML = `
+            ${extraNote ? `<div class="text-amber-300 mb-1">${esc(extraNote)}</div>` : ''}
+            <div class="text-slate-400">Other devices on your network can open:</div>
+            <ul class="list-disc list-inside mt-1 space-y-0.5">${list}</ul>
+            <div class="text-slate-500 mt-2">Your OS firewall may prompt the first time — allow Slopsmith Desktop so other devices can connect.</div>
+        `;
+        lanStatus.classList.remove('hidden');
+    }
+
+    if (network && lanToggle) {
+        network.getLanAccess()
+            .then(({ enabled, urls }) => {
+                lanToggle.checked = enabled;
+                renderLanStatus(enabled, urls);
+            })
+            .catch(() => { /* leave toggle in default unchecked state */ });
+
+        lanToggle.addEventListener('change', async () => {
+            const wanted = lanToggle.checked;
+            lanToggle.disabled = true;
+            renderLanStatus(wanted, [], 'Restarting server to apply…');
+            try {
+                const res = await network.setLanAccess(wanted);
+                renderLanStatus(res.enabled, res.urls);
+            } catch (e) {
+                lanToggle.checked = !wanted; // revert on failure
+                renderLanStatus(!wanted, [], 'Failed to change network setting: ' + (e?.message || e));
+            } finally {
+                lanToggle.disabled = false;
+            }
+        });
+    } else if (lanToggle) {
+        lanToggle.disabled = true;
+    }
+
     // Initial load
     refreshList();
 })();

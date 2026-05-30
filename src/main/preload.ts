@@ -335,6 +335,14 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         },
     },
 
+    // LAN access (opt-in: bind backend to 0.0.0.0 for multi-device / mobile sync)
+    network: {
+        getLanAccess: (): Promise<{ enabled: boolean; urls: string[] }> =>
+            ipcRenderer.invoke('network:getLanAccess'),
+        setLanAccess: (enabled: boolean): Promise<{ success: boolean; enabled: boolean; urls: string[] }> =>
+            ipcRenderer.invoke('network:setLanAccess', enabled),
+    },
+
     // File dialogs
     pickFile: (filters?: { name: string; extensions: string[] }[]) =>
         ipcRenderer.invoke('dialog:pickFile', filters),
