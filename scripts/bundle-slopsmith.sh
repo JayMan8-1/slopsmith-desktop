@@ -117,6 +117,60 @@ for dp in "$PROJECT_DIR/src/renderer" "$PROJECT_DIR/src/renderer/plugin-manager"
     fi
 done
 
+# ── Rebuild Tailwind CSS over the FULL bundled plugin set ──────────────────
+# Core's committed static/tailwind.min.css is built scanning only the in-tree
+# plugins (highway_3d, editor, note_detect, app_tour_*). Shipped as-is it would
+# leave most of the 30+ bundled plugins' classes unstyled — the Play CDN's
+# runtime JIT used to cover them, but it was removed (slopsmith#411). So
+# regenerate the sheet HERE, after every plugin is copied, so it covers the
+# whole bundled set and scales automatically as more plugins are added.
+#
+# We reuse core's tailwind.config.js for parity (same theme colors, safelist,
+# and the highway_3d exclusion — that plugin ships its own assets/plugin.css
+# via the `styles` capability). The config is copied into the bundle and run
+# from there so its relative content globs (./static/**, ./plugins/**) resolve
+# against the bundle regardless of Tailwind's cwd-vs-config-dir semantics.
+if command -v npx >/dev/null 2>&1; then
+    echo "=== Rebuilding Tailwind CSS over bundled plugins ==="
+    # Whole pipeline runs inside one guarded `if (...)` so ANY failure (config
+    # copy, no npm cache/network, build error, or the final swap) falls back to
+    # the committed sheet instead of aborting the bundle under `set -e`. Two
+    # subtleties: (1) `set -e` is suppressed inside an `if` condition, so the
+    # steps are &&-chained to make an early failure short-circuit; (2) the build
+    # writes to a temp file that's mv'd into place only as the last link, so a
+    # failed/partial `npx` can never truncate the committed fallback sheet.
+    if (
+        cp "$SLOPSMITH_DIR/tailwind.config.js" "$BUNDLE_DIR/tailwind.config.js" \
+        && cd "$BUNDLE_DIR" \
+        && npx -y tailwindcss@3.4.19 \
+            -c tailwind.config.js \
+            -i static/_tailwind.src.css \
+            -o static/tailwind.min.css.new \
+            --minify \
+        && mv -f static/tailwind.min.css.new static/tailwind.min.css
+    ); then
+        # Drop the build-only inputs so they don't ship in resources/slopsmith.
+        # `|| true`: cleanup is best-effort — a stray rm failure (e.g. Windows
+        # file locks) must never abort the bundle under `set -e`.
+        rm -f "$BUNDLE_DIR/tailwind.config.js" "$BUNDLE_DIR/static/_tailwind.src.css" || true
+        echo "  Tailwind CSS: $(wc -c < "$BUNDLE_DIR/static/tailwind.min.css") bytes (bundled-plugin-aware)"
+    else
+        # Discard any partial output; the committed sheet copied earlier stays
+        # intact. Still drop the build-only input so it never ships (matches the
+        # success path). `|| true` keeps cleanup non-fatal.
+        rm -f "$BUNDLE_DIR/tailwind.config.js" "$BUNDLE_DIR/static/tailwind.min.css.new" "$BUNDLE_DIR/static/_tailwind.src.css" || true
+        echo "WARN: Tailwind rebuild failed — shipping core's committed sheet as-is." >&2
+        echo "      Bundled plugins using classes outside it may render unstyled." >&2
+    fi
+else
+    # No rebuild engine; still drop the build-only input so bundle contents are
+    # consistent regardless of whether the rebuild ran. `|| true` keeps it
+    # non-fatal under `set -e`.
+    rm -f "$BUNDLE_DIR/static/_tailwind.src.css" || true
+    echo "WARN: npx/node not found — shipping core's committed tailwind.min.css as-is." >&2
+    echo "      Bundled plugins using classes outside core's sheet may render unstyled." >&2
+fi
+
 echo "  Slopsmith server: $(du -sh "$BUNDLE_DIR" | cut -f1)"
 echo "  Plugins: $(ls -d "$BUNDLE_DIR/plugins/"*/ 2>/dev/null | wc -l)"
 echo "=== Slopsmith bundle complete ==="
