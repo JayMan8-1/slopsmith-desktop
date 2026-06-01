@@ -1,0 +1,128 @@
+name: Addon CI
+
+# Per-OS build + load smoke-test for the native audio addon
+# (slopsmith_audio.node), on every pull request.
+#
+# Why this exists, separate from build.yml:
+#   build.yml runs the FULL electron-builder packaging/signing matrix and is
+#   deliberately gated off the pull_request event (every review commit would
+#   otherwise re-run a ~3x multi-GB release build). That left a gap: a PR that
+#   breaks the macOS/Linux *addon* compile or link was never built on those
+#   OSes until it had already merged to main. That is exactly how the #250
+#   regression shipped — an undefined symbol (typeinfo for
+#   slopsmith::sandbox::SandboxedProcessor) that links fine but fails at
+#   runtime dlopen, leaving AppImage/dmg users with empty audio device lists
+#   (issue #266, regression fixed in #263).
+#
+# This job is the cheap counterpart: it builds ONLY the addon
+# (`npm run build:audio` — no Python, no rscli, no electron-builder, no
+# signing) on all three OSes, then loads the resulting .node and asserts the
+# device-enumeration API is present. A plain build can't catch the #250 class
+# of bug: Node native modules link with undefined symbols permitted
+# (macOS uses -undefined dynamic_lookup; Linux has no -Wl,--no-undefined), so
+# the compile and link succeed even with an unresolved symbol — the failure
+# only surfaces at load time. The smoke-test load is what makes that fail CI.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel an in-flight run when new commits land on the same PR/branch — no
+# point burning three runners on a superseded commit during a review loop.
+concurrency:
+  group: addon-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this workflow only checks out code.
+permissions:
+  contents: read
+
+jobs:
+  addon:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - os: macos-14
+            platform: mac
+            arch: arm64
+          - os: windows-latest
+            platform: win
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # JUCE (and any vendored audio third_party)
+          # No step after checkout uses GITHUB_TOKEN (public repo, public
+          # submodules, no push), and this runs on pull_request — including
+          # from forks — so don't leave the token persisted in .git/config.
+          persist-credentials: false
+
+      # Match the Node version the app ships with — the addon is built against
+      # the Electron ABI, but node-addon-api headers come from node_modules and
+      # the toolchain is pinned via .build-config.json (single source of truth,
+      # same as build.yml).
+      - name: Read build configuration
+        id: config
+        shell: bash
+        run: |
+          NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
+          echo "node=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Node ${NODE_VERSION}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+          # Pin the Node binary architecture per runner (arm64 on macos-14,
+          # x64 elsewhere) so the addon's node-addon-api headers and the
+          # toolchain match the OS the build targets.
+          architecture: ${{ matrix.arch }}
+
+      # Linux: the addon links juce_audio_devices (ALSA/JACK) and pulls in
+      # juce_audio_processors' transitive X11/freetype/fontconfig deps at build
+      # time. Install from .packages/apt.txt — the same canonical list
+      # build-linux-ubuntu.sh uses — so this stays in sync with the real build.
+      # xvfb is added on top (not in apt.txt) purely as insurance for the
+      # load-time smoke-test below.
+      - name: Install Linux build deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          PACKAGES=$(grep -v '^[[:space:]]*#' .packages/apt.txt | grep -v '^[[:space:]]*$' | tr '\n' ' ')
+          sudo apt-get install -y --no-install-recommends $PACKAGES xvfb
+
+      # cmake-js + node-addon-api come from node_modules. No package-lock.json
+      # in this repo, so `npm install` (not `npm ci`).
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build native audio addon
+        run: npm run build:audio
+        shell: bash
+
+      # Load the freshly built .node and assert the device-enumeration entry
+      # points are present. slopsmith_audio.node is an N-API addon (ABI-stable
+      # across runtimes), so plain `node` can load an Electron-built binary —
+      # this is the exact reproduction Byron confirmed locally for #250, where
+      # the load fails with "undefined symbol: ...SandboxedProcessor..." even
+      # though the build was green. typeof getDeviceTypes === 'function' also
+      # verifies the device API the empty-device-list regression was about.
+      - name: Smoke-test addon load (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          xvfb-run -a node -e "const a=require('./build/Release/slopsmith_audio.node'); if(typeof a.getDeviceTypes!=='function'){console.error('FAIL: getDeviceTypes export missing'); process.exit(1);} console.log('addon loaded; device API present');"
+
+      - name: Smoke-test addon load (macOS / Windows)
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          node -e "const a=require('./build/Release/slopsmith_audio.node'); if(typeof a.getDeviceTypes!=='function'){console.error('FAIL: getDeviceTypes export missing'); process.exit(1);} console.log('addon loaded; device API present');"
