@@ -1,84 +1,22 @@
-// Windows sandbox factory.
-//
-// Decides whether a plugin should be loaded through the sandbox and, if so,
-// constructs a SandboxedProcessor (which spawns slopsmith-vst-host.exe).
+// Sandbox factory — Windows resolveSandboxExe(). The routing policy
+// (shouldSandbox / tryLoadSandboxed / the crash blocklist) is platform-neutral
+// and lives in SandboxFactory_shared.cpp.
 
 #include "SandboxedProcessor.h"
 #include "../VSTTrace.h"
 
 #include <juce_core/juce_core.h>
-#include <cmath>      // std::isfinite, std::lround
-#include <limits>     // std::numeric_limits
-#include <mutex>      // guards the runtime crash blocklist
-#include <vector>     // dynamic buffer for SLOPSMITH_DEV_SANDBOX_PATH
-#include <windows.h> // GetModuleHandleExW / GetModuleFileNameW
+#include <vector>     // dynamic buffer for the module-path + env-var lookups
+#include <windows.h>  // GetModuleHandleExW / GetModuleFileNameW
 
 namespace slopsmith::sandbox {
-
-namespace {
-
-// Historical pre-seed of plugins known to fail in-process. With the
-// sandbox-by-default policy in shouldSandbox() below, every VST3 routes to
-// the sandbox regardless of this list, so it no longer determines routing
-// on its own. It survives as (a) documentation of *why* each plugin
-// originally needed the sandbox, (b) diagnostic tagging in shouldSandbox's
-// VST_TRACE output, and (c) forward-looking infrastructure for a future
-// per-plugin opt-out — i.e., a way to allow specific plugins back into the
-// in-process path. These are the plugins that should never be opted out.
-//
-// MIDI is supported in the sandbox since the v2 audio-shm inline-MIDI
-// protocol — instruments are no longer muted by the sandbox path.
-const juce::StringArray kDefaultNeedsSandboxFilenames = {
-    "Guitar Rig",
-    // PolyChrome DSP Graphene — its editor faults (access violation) when
-    // created in-process; the sandbox owns the editor window out-of-process.
-    // This is also the pre-seed for the runtime crash blocklist below: known
-    // offenders never crash anyone, while unknown ones are caught after one
-    // crash by the renderer's VST crash guard and registered via
-    // setCrashedPlugins().
-    "Graphene",
-    // IK Multimedia TONEX — corrupts memory when hosted in-process and takes
-    // the whole app down. Field minidumps show two manifestations of the same
-    // disease: a 0xC0000374 heap double-free, and a 0xC0000005 DEP/execute
-    // fault from a call through a recycled vtable. The fault is inside TONEX's
-    // own code and only surfaces in-process, so route it out-of-process where
-    // a crash is contained to the sandbox child instead of killing Slopsmith.
-    // TONEX is an audio effect (no MIDI), so the sandbox MIDI caveat above
-    // does not apply.
-    "TONEX",
-    // IK Multimedia AmpliTube — does not work in-process for several reasons.
-    // (1) Its init posts WM_USER / WM_TIMER to itself and assumes the host's
-    // message thread is the OS main thread; on Slopsmith's background JUCE
-    // message thread those self-messages starve, leaving a half-wired editor
-    // that crashes on its first WindowProc dispatch (a 0xC read at offset
-    // 0xC — null-this — was the original field minidump). (2) Even after the
-    // PR #173 async-load fix, pressing Edit hangs or crashes for testers
-    // because createEditorAndMakeActive still runs synchronously on that
-    // wrong thread. (3) AmpliTube's VST3 and standalone share one global
-    // config file and the VST3 init writes audio-device / ASIO settings into
-    // it, clobbering the standalone whenever it's loaded in-process. All
-    // three symptoms vanish in a real-main-thread + STA-COM environment
-    // (works fine in Cubase). The sandbox child provides exactly that.
-    // AmpliTube is an audio effect (no MIDI), so the MIDI caveat above does
-    // not apply.
-    "AmpliTube",
-};
-
-// Runtime crash blocklist: full plugin paths that crashed the app on a
-// previous run, supplied by the renderer's VST crash guard via
-// setCrashedPlugins(). Guarded by a mutex — set once at startup on the addon
-// thread, read by shouldSandbox() on the JUCE message thread.
-std::mutex g_crashedPluginsMutex;
-juce::StringArray g_crashedPlugins;
-
-} // anonymous
 
 juce::File resolveSandboxExe()
 {
     // Locate the directory of the .node DLL via GetModuleHandleEx with this
-    // function's address — juce::File::currentExecutableFile returns the
-    // host's exe (node.exe / electron.exe / slopsmith.exe) when we're loaded
-    // as an addon, which points at the wrong directory entirely.
+    // function's address — juce::File::currentExecutableFile returns the host's
+    // exe (node.exe / electron.exe) when we're loaded as an addon, which points
+    // at the wrong directory entirely.
     juce::File addonDir;
     HMODULE selfModule = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -87,11 +25,9 @@ juce::File resolveSandboxExe()
                            &selfModule)
         && selfModule != nullptr)
     {
-        // Grow the buffer until GetModuleFileNameW returns < capacity
-        // (success). On truncation it returns == capacity with
-        // ERROR_INSUFFICIENT_BUFFER. MAX_PATH is the floor for back-compat,
-        // but long-paths-enabled installs / deep dev trees can blow past
-        // it. Cap at 32K to mirror the Windows long-path ceiling.
+        // Grow the buffer until GetModuleFileNameW returns < capacity. MAX_PATH
+        // is the floor for back-compat; long-paths-enabled installs / deep dev
+        // trees can blow past it. Cap at 32K (Windows long-path ceiling).
         std::vector<wchar_t> buf(MAX_PATH + 1);
         for (;;)
         {
@@ -107,28 +43,15 @@ juce::File resolveSandboxExe()
         }
     }
 
-    // Dev: build/Release/slopsmith-vst-host.exe next to the addon .node.
     if (addonDir.exists())
     {
         auto candidate = addonDir.getChildFile("slopsmith-vst-host.exe");
         if (candidate.existsAsFile()) return candidate;
-
-        // Electron-packaged: resources/app.asar.unpacked/build/Release/...
-        // currently the build/Release is the addon dir, so a sibling layout
-        // resolves here. The full asar-unpacked lookup is on the packaging
-        // follow-up (see PR-body checklist).
     }
 
-    // Explicit dev override — opt-in via SLOPSMITH_DEV_SANDBOX_PATH.
-    // The previous implicit CWD probe would have spawned any
-    // `build/Release/slopsmith-vst-host.exe` happening to be in the
-    // launch directory, which is a search-path attack vector. Fail
-    // closed in production; require the env var for dev workflows.
-    // Use the W variant + dynamic buffer so long-paths-enabled installs
-    // and deep dev trees beyond MAX_PATH still work. First call probes
-    // for the required size; second call reads into the right-sized
-    // buffer. The first-call return semantics are: required-size-incl-NUL
-    // if buffer too small, actual-length-excl-NUL otherwise, 0 if missing.
+    // Explicit dev override — opt-in via SLOPSMITH_DEV_SANDBOX_PATH. The
+    // previous implicit CWD probe was a search-path attack vector; fail closed
+    // in production, require the env var for dev workflows.
     const wchar_t* kVar = L"SLOPSMITH_DEV_SANDBOX_PATH";
     const DWORD probe = GetEnvironmentVariableW(kVar, nullptr, 0);
     if (probe > 0)
@@ -137,8 +60,6 @@ juce::File resolveSandboxExe()
         const DWORD got = GetEnvironmentVariableW(kVar, buf.data(), probe);
         if (got > 0 && got < probe)
         {
-            // Brace-init avoids the most-vexing-parse on
-            // `File explicitPath(juce::String(buf.data()));`.
             const juce::File explicitPath{ juce::String(buf.data()) };
             if (explicitPath.existsAsFile()) return explicitPath;
         }
@@ -151,140 +72,6 @@ juce::File resolveSandboxExe()
     }
 
     return {};
-}
-
-// Routing policy: every VST3 plugin loads via the out-of-process sandbox.
-// Non-VST3 processors (NAM, IR) stay in-process.
-//
-// Why default to sandboxed: many VSTs assume their host's message thread is
-// the OS main thread, with proper STA COM initialisation — the environment
-// native DAWs give plugins by construction. Slopsmith is Electron: V8 owns
-// the OS main thread, so JUCE's message thread is a *background* thread.
-// That mismatch is the root cause of nearly every in-process plugin failure
-// we have crash dumps for (AmpliTube's half-wired editor, TONEX's heap
-// corruption, Graphene's editor access violation, ASIO driver AVs touched
-// by AmpliTube's shared standalone init). The sandbox child's WinMain *is*
-// its message thread, with STA COM init — exactly the environment plugins
-// expect. Containment is a byproduct: a sandbox crash kills the disposable
-// child, not Slopsmith.
-//
-// The pre-seed list and runtime crash blocklist remain. They no longer gate
-// routing on their own — every VST3 takes the sandbox path regardless — but
-// the VST_TRACE output preserves *why* a given plugin matched, which is
-// useful for diagnostics and for a future per-plugin opt-out (a way to let
-// specific plugins back into the in-process path).
-bool shouldSandbox(const juce::PluginDescription& desc)
-{
-    const auto path = juce::File(desc.fileOrIdentifier);
-
-    // VST3 only: non-VST3 processors (NAM models, IRs) keep loading in-process.
-    if (!path.getFileName().endsWithIgnoreCase(".vst3"))
-        return false;
-
-    // Runtime crash blocklist — diagnostic tagging only under the
-    // sandbox-by-default policy. Canonical full-path form so a slash-direction
-    // or relative/absolute difference between the persisted path and the one
-    // handed to LoadVST can't cause a silent miss.
-    {
-        const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
-        const auto canonical = path.getFullPathName();
-        if (g_crashedPlugins.contains(canonical, /*ignoreCase*/ true))
-        {
-            VST_TRACE("shouldSandbox: %s — on the runtime crash blocklist",
-                      desc.fileOrIdentifier.toRawUTF8());
-            return true;
-        }
-    }
-
-    // Pre-seed filename match — diagnostic tagging only under the
-    // sandbox-by-default policy. Prefix-anchored on the basename so a non-NI
-    // plugin whose name happens to contain "Guitar Rig" doesn't get a
-    // misleading trace line.
-    const auto basename = path.getFileNameWithoutExtension();
-    for (auto& needle : kDefaultNeedsSandboxFilenames)
-    {
-        if (basename.startsWithIgnoreCase(needle))
-        {
-            VST_TRACE("shouldSandbox: %s — filename starts with '%s'",
-                      desc.fileOrIdentifier.toRawUTF8(),
-                      needle.toRawUTF8());
-            return true;
-        }
-    }
-
-    VST_TRACE("shouldSandbox: %s — default policy (every VST3 sandboxes)",
-              desc.fileOrIdentifier.toRawUTF8());
-    return true;
-}
-
-std::unique_ptr<juce::AudioProcessor> tryLoadSandboxed(
-    const juce::PluginDescription& desc,
-    double sampleRate, int blockSize,
-    juce::String& errorOut)
-{
-    if (!shouldSandbox(desc))
-        return nullptr;
-
-    auto exe = resolveSandboxExe();
-    if (!exe.existsAsFile())
-    {
-        errorOut = "slopsmith-vst-host.exe not found";
-        return nullptr;
-    }
-
-    // Validate sampleRate before narrowing to uint32_t — `(uint32_t)NaN` is UB
-    // and silently accepting 0 / negative / overflow makes a bad caller surface
-    // as a late sandbox-spawn failure instead of a clear errorOut here.
-    if (! std::isfinite(sampleRate) || sampleRate <= 0.0
-        || sampleRate > (double)(std::numeric_limits<uint32_t>::max)())
-    {
-        errorOut = "invalid sampleRate: " + juce::String(sampleRate);
-        return nullptr;
-    }
-
-    SandboxedProcessor::SpawnConfig cfg;
-    cfg.pluginPath = desc.fileOrIdentifier;
-    cfg.pluginName = desc.name.isNotEmpty() ? desc.name : "plugin";
-    cfg.sandboxExePath = exe.getFullPathName();
-    cfg.audio.sampleRate = (uint32_t)std::lround(sampleRate);
-    // Clamp to the protocol cap: vst-host's kPrepare rejects blockSize
-    // > kAudioMaxBlockSamples, so spawning a larger shm layout would later
-    // fail the prepare round-trip rather than silently misbehave.
-    cfg.audio.maxBlockSamples = (uint32_t)juce::jlimit(
-        64, (int)kAudioMaxBlockSamples, blockSize);
-    cfg.audio.maxChannels = 2;
-    cfg.audio.maxBlocks = kAudioMaxBlocks;
-
-    return SandboxedProcessor::spawn(cfg, errorOut);
-}
-
-void addCrashedPlugin(const juce::String& pluginPath)
-{
-    if (pluginPath.isEmpty()) return;
-    // Canonicalise to match the lookup form used in shouldSandbox() — without
-    // this, a path passed in with mixed slashes or as a relative form would
-    // sit alongside the canonical version and one of the two would never hit.
-    const auto canonical = juce::File(pluginPath).getFullPathName();
-    const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
-    if (! g_crashedPlugins.contains(canonical, /*ignoreCase*/ true))
-    {
-        g_crashedPlugins.add(canonical);
-        VST_TRACE("addCrashedPlugin: %s appended to runtime crash blocklist",
-                  canonical.toRawUTF8());
-    }
-}
-
-void setCrashedPlugins(const juce::StringArray& pluginPaths)
-{
-    const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
-    // Store in canonical full-path form so the shouldSandbox() lookup matches
-    // regardless of slash direction or relative/absolute differences between
-    // the persisted path and the one LoadVST is given.
-    g_crashedPlugins.clearQuick();
-    for (const auto& p : pluginPaths)
-        g_crashedPlugins.add(p.isNotEmpty() ? juce::File(p).getFullPathName() : p);
-    VST_TRACE("setCrashedPlugins: %d plugin(s) on the runtime crash blocklist",
-              g_crashedPlugins.size());
 }
 
 } // namespace slopsmith::sandbox

@@ -2,7 +2,12 @@
 
 Date: 2026-05-13
 Companion to: `docs/VST-SANDBOX-DIAG.md`
-Status: partially implemented (Windows v1, WIP); macOS/Linux pending
+Status: Windows v1 shipped; POSIX (macOS/Linux) IPC foundation + runtime +
+editor wired and active (§11) — VST3 plugins route through the sandbox on all
+three desktop platforms. The macOS sandbox-child editor window (floating
+NSWindow + foreground activation policy) is implemented; Linux intentionally
+does not advertise an editor (`hasEditor()` returns false). True parent-window
+embedding (CARemoteLayer) remains out of scope.
 
 ## 1. Topology
 
@@ -356,3 +361,58 @@ Wall clock for a single engineer, assuming the PoC's foundations:
 
 Roughly 3–4 calendar weeks, in line with the diag report's original estimate, with
 none of it spent fighting Qt.
+
+## 11. POSIX backend (macOS / Linux) — IPC foundation
+
+Tracked by issue #264 (macOS port). The IPC layer is split into a platform-neutral
+core (`*_shared.cpp`: the lock-free ring algorithm, the request/reply/dispatch loop)
+plus per-OS backends (`*_win.cpp` / `*_posix.cpp`) selected in CMake, with the private
+`Impl` struct in `*Impl.h`. The Win32 primitives map to POSIX as follows — the choices
+are driven by what is simultaneously *implemented on macOS*, *crash-safe*, and *tolerant
+of coalesced wakeups*:
+
+| Win32 | POSIX | Why |
+|---|---|---|
+| Named pipe + overlapped I/O + `WaitForMultipleObjects(io, stopEvent)` | `socketpair(AF_UNIX, SOCK_STREAM)` + `poll()` + self-pipe stop | UDS has identical stream/partial-read semantics, so the `[u32-LE][body]` framing carries over unchanged; the self-pipe is the manual-reset stopEvent (one never-drained byte). fd-passed, not named → dodges the macOS `sun_path` 104-char limit and leaves no socket file to leak. |
+| Named file-mapping shm (`CreateFileMappingW` + name) | `shm_open(O_CREAT\|O_EXCL)` + `ftruncate` + **immediate `shm_unlink`**, fd-passed | Anonymous after unlink (fd keeps it alive) → no `/dev/shm` leak on crash, and the macOS 31-char shm-name limit is irrelevant past creation. `fstat().st_size` replaces `VirtualQuery` for the size-bounds check. |
+| Named auto-reset events (`CreateEventW`/`SetEvent`/`WaitForSingleObject`) | **socketpair doorbell** (write 1 byte = signal; `poll` + drain = wait) | The *only* cross-process option that is (a) implemented on macOS — `sem_init` is ENOSYS there; (b) crash-safe — a process-shared pthread mutex has no robust-mutex support on macOS, so a producer crash would deadlock the consumer, whereas a dead socketpair peer surfaces as `POLLHUP`; (c) tolerant of coalesced signals — the ring consumers re-read the atomic index on wake exactly as on the Win32 auto-reset path. |
+| `CreateProcessW`, `bInheritHandles=FALSE` | `posix_spawn` + `POSIX_SPAWN_CLOEXEC_DEFAULT` + `file_actions_adddup2` | `posix_spawn` (never a bare fork — the host has touched CoreAudio/Obj-C and fork-without-exec aborts in CF). `CLOEXEC_DEFAULT` (macOS) is the analog of `bInheritHandles=FALSE`: only the dup2()'d channel/doorbell/shm fds reach the child. Linux lacks the flag; the host keeps its fds CLOEXEC instead. |
+| `WaitForSingleObject(hProcess)` watcher | blocking `waitpid` in a thread | No global SIGCHLD handler (it would fight libuv's child reaping inside Electron); ECHILD (someone else reaped) is tolerated. `kqueue`/`EVFILT_PROC` is the documented fallback if ECHILD proves common. |
+| `PostThreadMessageW(WM_QUIT)` → `TerminateProcess` | `shutdown` control op → `SIGTERM` → `SIGKILL` | |
+
+Trap handled in slice 1: writing to a socket whose peer has closed raises **SIGPIPE**
+(kills the process by default) where Windows merely returns an error — every send uses
+`MSG_NOSIGNAL` (Linux) and the fd carries `SO_NOSIGPIPE` (macOS), so a dead peer surfaces
+as `EPIPE`, never a signal.
+
+The POSIX backends compile on both macOS and Linux (shared primitives) and are verified
+by `tests/sandbox/` — an in-process audio-ring loopback (incl. a contended threaded
+producer/consumer over the doorbell), an in-process control-channel loopback, a real
+`posix_spawn` smoke test (handshake, fd inheritance, clean exit, crash detection, SIGPIPE
+suppression), and a full **end-to-end** harness (`tests/sandbox/e2e/`) that spawns the
+real `slopsmith-vst-host`, loads a passthrough VST3, and round-trips paced audio over the
+shm ring with state + clean shutdown. The unit tests run plain + ASan + TSan and the e2e
+runs on `ubuntu-22.04` + `macos-14` in `.github/workflows/sandbox.yml`; the TSan run on the
+threaded audio loopback validates the release/acquire ring ordering on arm64.
+
+Runtime wiring: `SandboxFactory_posix` + `SandboxedProcessor` are compiled into
+`slopsmith_audio.node` on macOS/Linux, and `slopsmith-vst-host` is built by the same
+cmake-js invocation + co-located with the addon (and bundled via `package.json`), so VST3
+plugins route through the sandbox on all three platforms.
+
+A subtlety the e2e surfaced: `signalSandboxWake()` must wake the sandbox's *own* audio
+worker, but a write to the bidirectional doorbell socketpair goes to the *peer*. The POSIX
+backend uses a dedicated per-side self-wake pipe for it (`waitEvent` polls the socketpair
+*and* the self-pipe); Windows is unaffected (separate auto-reset events per direction).
+
+Editor (Slice 3): the sandbox child owns a floating top-level editor window (Reaper-style —
+the host never reparents it, it only tracks the open/closed bit). On macOS the child calls
+`juce::Process::makeForegroundProcess()` before showing the window so a `posix_spawn`'d
+executable (default background activation policy) can show + focus its `NSWindow`; NodeAddon's
+editor open/close IPC paths are widened from `#if JUCE_WINDOWS` to all platforms. The
+open/close protocol is asserted by the e2e on macOS CI; visual focus/DPI is the irreducible
+headless blind spot (manual on a real Mac). **Linux** deliberately does *not* advertise an
+editor (`hasEditor()` returns false): JUCE's VST3 plugin-editor hosting on X11
+(IRunLoop/XEmbed) is too fragile to drive reliably and is out of scope for the macOS port —
+audio + state hosting are fully functional there. True cross-process embedding
+(CARemoteLayer / Mach-port) and a packaged `.app` bundle / Dock polish remain future work.

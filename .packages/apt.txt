@@ -6,7 +6,12 @@ libasound2-dev
 libjack-jackd2-dev
 
 # Graphics/X11 libraries (required by JUCE)
+# fontconfig is a hard requirement of juce_graphics (declared linuxPackages:
+# "freetype2 fontconfig"), pulled in once slopsmith-vst-host — which links
+# juce_gui_basics/juce_graphics — builds on Linux. Without it CMake configure
+# fails at pkg_check_modules(freetype2 fontconfig) on a clean machine.
 libfreetype-dev
+libfontconfig1-dev
 libx11-dev
 libxrandr-dev
 libxcursor-dev

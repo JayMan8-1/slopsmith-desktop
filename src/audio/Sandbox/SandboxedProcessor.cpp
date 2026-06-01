@@ -4,8 +4,10 @@
 #include "SubprocessHandle.h"
 #include "../VSTTrace.h"
 
-#if JUCE_WINDOWS
- #include <windows.h>
+#if ! JUCE_WINDOWS
+ #include <fcntl.h>     // F_DUPFD_CLOEXEC
+ #include <unistd.h>    // close
+ #include <vector>
 #endif
 
 namespace slopsmith::sandbox {
@@ -82,13 +84,28 @@ bool SandboxedProcessor::initialise(juce::String& errorOut)
     subprocess = std::make_unique<SubprocessHandle>();
     juce::StringArray args;
     args.add("--plugin-path");      args.add(spawnConfig.pluginPath);
+    args.add("--sample-rate");      args.add(juce::String((int)spawnConfig.audio.sampleRate));
+    args.add("--max-block");        args.add(juce::String((int)spawnConfig.audio.maxBlockSamples));
+    args.add("--channels");         args.add(juce::String((int)spawnConfig.audio.maxChannels));
+
+#if JUCE_WINDOWS
+    // Windows: the child re-opens the IPC objects by name.
     args.add("--control-pipe");     args.add(pipeName);
     args.add("--audio-shm");        args.add(audioNames.shm);
     args.add("--audio-event-out");  args.add(audioNames.evtToHost);
     args.add("--audio-event-in");   args.add(audioNames.evtToSandbox);
-    args.add("--sample-rate");      args.add(juce::String((int)spawnConfig.audio.sampleRate));
-    args.add("--max-block");        args.add(juce::String((int)spawnConfig.audio.maxBlockSamples));
-    args.add("--channels");         args.add(juce::String((int)spawnConfig.audio.maxChannels));
+#else
+    // POSIX: the IPC objects are fd-passed (no named objects). The child
+    // reads its fd numbers from argv; SubprocessHandle::startPosix dup2()s the
+    // host-side fds onto these fixed numbers in the child. Targets sit past
+    // stdin/stdout/stderr.
+    static constexpr int kChildControlFd  = 3;
+    static constexpr int kChildAudioEvtFd = 4;
+    static constexpr int kChildAudioShmFd = 5;
+    args.add("--control-fd");       args.add(juce::String(kChildControlFd));
+    args.add("--audio-evt-fd");     args.add(juce::String(kChildAudioEvtFd));
+    args.add("--audio-shm-fd");     args.add(juce::String(kChildAudioShmFd));
+#endif
 
     // ControlChannel keeps the event callback past initialise()'s return, so
     // the ready-handshake state has to outlive this stack frame. Wrap it in a
@@ -222,12 +239,56 @@ bool SandboxedProcessor::initialise(juce::String& errorOut)
         errorOut = "control->start failed: " + control->getLastStartError();
         return false;
     }
-    if (!subprocess->start(spawnConfig.sandboxExePath, args,
-                           [this, failHandshake](int code)
-                           {
-                               failHandshake();
-                               teardown("sandbox exit code " + juce::String(code));
-                           }, err))
+
+    auto onExitCb = [this, failHandshake](int code)
+    {
+        failHandshake();
+        teardown("sandbox exit code " + juce::String(code));
+    };
+
+#if JUCE_WINDOWS
+    const bool spawnOk = subprocess->start(spawnConfig.sandboxExePath, args,
+                                           onExitCb, err);
+#else
+    // Dup each host-side handoff fd to a high number (>= 10) before spawning,
+    // so none collides with a child target fd (3/4/5). posix_spawn applies the
+    // dup2 file-actions in order in the child; without this, a source fd that
+    // happens to equal a *later* action's target would be clobbered first.
+    // F_DUPFD_CLOEXEC keeps the temporaries out of the child (only the
+    // explicit dup2 targets survive under POSIX_SPAWN_CLOEXEC_DEFAULT).
+    auto dupHigh = [](int fd) { return fd < 0 ? -1 : ::fcntl(fd, F_DUPFD_CLOEXEC, 10); };
+    const int ctlSrc = dupHigh(control->sandboxFd());
+    const int evtSrc = dupHigh(audioNames.sandboxAudioFd);
+    const int shmSrc = dupHigh(audioNames.shmFd);
+
+    bool spawnOk = false;
+    if (ctlSrc < 0 || evtSrc < 0 || shmSrc < 0)
+    {
+        err = "failed to dup sandbox handoff fds";
+    }
+    else
+    {
+        std::vector<SubprocessHandle::InheritedFd> inherited{
+            { kChildControlFd,  ctlSrc },
+            { kChildAudioEvtFd, evtSrc },
+            { kChildAudioShmFd, shmSrc },
+        };
+        spawnOk = subprocess->startPosix(spawnConfig.sandboxExePath, args,
+                                         inherited, onExitCb, err);
+    }
+    // Close the high-dup temporaries (posix_spawn captured them at call time)
+    // and our copies of the handoff fds, now dup2()'d into the child. The host
+    // keeps its own channel ends in the channels' Impl; dropping these lets the
+    // host observe EOF/POLLHUP when the child dies.
+    if (ctlSrc >= 0) ::close(ctlSrc);
+    if (evtSrc >= 0) ::close(evtSrc);
+    if (shmSrc >= 0) ::close(shmSrc);
+    control->closeSandboxFd();
+    if (audioNames.shmFd >= 0)         ::close(audioNames.shmFd);
+    if (audioNames.sandboxAudioFd >= 0) ::close(audioNames.sandboxAudioFd);
+#endif
+
+    if (!spawnOk)
     {
         errorOut = "subprocess: " + err;
         // Symmetry with the success path: control->start() already armed the

@@ -49,14 +49,15 @@ include("${CMAKE_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
 add_subdirectory(src/audio)
 
-# VST scan / sandbox subprocess helpers (Windows host, macOS scan helper).
-if(WIN32 OR APPLE)
-    add_subdirectory(src/vst-host)
-endif()
+# Out-of-process VST helpers (slopsmith-vst-host on all platforms now that the
+# POSIX sandbox runtime exists; macOS also builds the slopsmith-vst-scan probe).
+add_subdirectory(src/vst-host)
 
-# Tests (Win32-only; gated on SLOPSMITH_BUILD_TESTS, default ON).
-# enable_testing() must be at the top level so `ctest` from the root build
-# directory discovers tests registered via add_test() in subdirectories.
+# Tests (cross-platform; gated on SLOPSMITH_BUILD_TESTS, default ON). The
+# audio-ring loopback runs everywhere; the control-channel + posix_spawn smoke
+# tests are POSIX-only (see tests/sandbox/CMakeLists.txt). enable_testing() must
+# be at the top level so `ctest` from the root build directory discovers tests
+# registered via add_test() in subdirectories.
 if(EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)

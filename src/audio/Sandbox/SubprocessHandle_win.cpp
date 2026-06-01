@@ -1,18 +1,15 @@
-#include "SubprocessHandle.h"
+// SubprocessHandle — Windows backend (CreateProcessW + WM_QUIT/TerminateProcess
+// shutdown + WaitForSingleObject exit watcher). POSIX lives in
+// SubprocessHandle_posix.cpp.
+
+#include "SubprocessHandleImpl.h"
 #include "../VSTTrace.h"
 
-#if JUCE_WINDOWS
- #include <windows.h>
-#else
- #error "SubprocessHandle.cpp is Windows-only for now."
+#if ! JUCE_WINDOWS
+ #error "SubprocessHandle_win.cpp is Windows-only; POSIX builds use SubprocessHandle_posix.cpp."
 #endif
 
 namespace slopsmith::sandbox {
-
-struct SubprocessHandle::Impl
-{
-    PROCESS_INFORMATION pi{};
-};
 
 SubprocessHandle::SubprocessHandle() : impl(std::make_unique<Impl>()) {}
 

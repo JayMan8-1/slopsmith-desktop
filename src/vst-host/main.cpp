@@ -34,11 +34,12 @@
 // triggers a syntax error in the Win11 SDK (10.0.26100.0) when the JUCE
 // preamble hasn't run yet, so the transitive dep is intentional.
 
-#if !JUCE_WINDOWS
- #error "slopsmith-vst-host is Windows-only for now."
+#if JUCE_WINDOWS
+ #include <windows.h>
+#else
+ #include <cstdlib>    // getenv, std::_Exit
+ #include <unistd.h>   // getpid
 #endif
-
-#include <windows.h>
 
 #include "../audio/Sandbox/Protocol.h"
 #include "../audio/Sandbox/ControlChannel.h"
@@ -60,11 +61,17 @@ namespace {
 struct Args
 {
     juce::String pluginPath;
-    juce::String controlPipe;
     AudioChannel::Names audio;
     int sampleRate = 48000;
     int maxBlock   = 1024;
     int channels   = 2;
+#if JUCE_WINDOWS
+    juce::String controlPipe;   // named pipe (re-opened by name)
+#else
+    int controlFd = -1;         // inherited control socketpair end
+    // audio.shmFd / audio.sandboxAudioFd carry the inherited audio fds (POSIX
+    // fields of AudioChannel::Names).
+#endif
 };
 
 // Accepts only the space-separated `--key value` form (loop steps i+=2).
@@ -91,8 +98,9 @@ inline bool parseStrictPositiveInt(const juce::String& text, int& dst)
     return true;
 }
 
-bool parseArgs(int argc, wchar_t** argv, Args& out, juce::String& whyFailed)
+bool parseArgs(const juce::StringArray& tokens, Args& out, juce::String& whyFailed)
 {
+    const int argc = tokens.size();
     // Track which flags have been set so a duplicate (e.g. from a future
     // spawn-args refactor with a copy-paste bug) errors loudly instead of
     // silently using the last-wins value.
@@ -112,8 +120,8 @@ bool parseArgs(int argc, wchar_t** argv, Args& out, juce::String& whyFailed)
             whyFailed = "unpaired key at position " + juce::String(i);
             return false;
         }
-        juce::String key(argv[i]);
-        juce::String val(argv[i + 1]);
+        const juce::String key = tokens[i];
+        const juce::String val = tokens[i + 1];
         // Catch the missing-value-followed-by-another-flag case
         // (e.g. `--plugin-path --control-pipe foo`) so the diagnostic
         // points at the actual mistake rather than misparsing the next
@@ -138,10 +146,30 @@ bool parseArgs(int argc, wchar_t** argv, Args& out, juce::String& whyFailed)
             return false;
         }
         if      (key == "--plugin-path")     out.pluginPath = val;
+#if JUCE_WINDOWS
         else if (key == "--control-pipe")    out.controlPipe = val;
         else if (key == "--audio-shm")       out.audio.shm = val;
         else if (key == "--audio-event-out") out.audio.evtToHost = val;
         else if (key == "--audio-event-in")  out.audio.evtToSandbox = val;
+#else
+        // POSIX: the IPC objects are inherited fds (see SubprocessHandle::
+        // startPosix), passed as fd numbers rather than kernel-object names.
+        else if (key == "--control-fd")
+        {
+            if (!parseStrictPositiveInt(val, out.controlFd))
+            { whyFailed = "invalid --control-fd='" + val + "'"; return false; }
+        }
+        else if (key == "--audio-shm-fd")
+        {
+            if (!parseStrictPositiveInt(val, out.audio.shmFd))
+            { whyFailed = "invalid --audio-shm-fd='" + val + "'"; return false; }
+        }
+        else if (key == "--audio-evt-fd")
+        {
+            if (!parseStrictPositiveInt(val, out.audio.sandboxAudioFd))
+            { whyFailed = "invalid --audio-evt-fd='" + val + "'"; return false; }
+        }
+#endif
         else if (key == "--sample-rate")
         {
             if (!parseStrictPositiveInt(val, out.sampleRate))
@@ -167,10 +195,16 @@ bool parseArgs(int argc, wchar_t** argv, Args& out, juce::String& whyFailed)
     // spawn command line surfaces immediately instead of as a generic
     // "bad args" log line.
     if (out.pluginPath.isEmpty())        { whyFailed = "missing --plugin-path"; return false; }
+#if JUCE_WINDOWS
     if (out.controlPipe.isEmpty())       { whyFailed = "missing --control-pipe"; return false; }
     if (out.audio.shm.isEmpty())         { whyFailed = "missing --audio-shm"; return false; }
     if (out.audio.evtToHost.isEmpty())   { whyFailed = "missing --audio-event-out"; return false; }
     if (out.audio.evtToSandbox.isEmpty()){ whyFailed = "missing --audio-event-in"; return false; }
+#else
+    if (out.controlFd < 0)               { whyFailed = "missing --control-fd"; return false; }
+    if (out.audio.shmFd < 0)             { whyFailed = "missing --audio-shm-fd"; return false; }
+    if (out.audio.sandboxAudioFd < 0)    { whyFailed = "missing --audio-evt-fd"; return false; }
+#endif
     // parseStrictPositiveInt above already rejects zero/negative values, so
     // the `<= 0` checks would never fire — strengthen to sane minimums
     // instead. A `--max-block 1` spawn would technically pass the >0
@@ -506,7 +540,16 @@ inline void teardownGuiOnMessageThread(HostState& st, bool postQuit)
         st.editorWindow.reset();
         st.editor.reset();
         st.running.store(false, std::memory_order_release);
-        if (postQuit) PostQuitMessage(0);
+        if (postQuit)
+        {
+#if JUCE_WINDOWS
+            PostQuitMessage(0);
+#else
+            // POSIX equivalent: stopDispatchLoop() sets the same flag
+            // hasStopMessageBeenSent() reports, breaking the runDispatchLoop.
+            juce::MessageManager::getInstance()->stopDispatchLoop();
+#endif
+        }
     }))
     {
         // callAsync false does NOT guarantee the message thread has shut
@@ -893,9 +936,13 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     reply(false, {}, "user closed editor during open");
                     return;
                 }
+                juce::Process::makeForegroundProcess();
                 st.editorWindow->setVisible(true);
                 st.editorWindow->toFront(true);
-                HWND existing = (HWND)st.editorWindow->getWindowHandle();
+                // void* native handle: HWND on Windows, NSView* on macOS, X11
+                // Window on Linux. The host no longer reparents it (top-level-
+                // window model), so it's returned only as an opaque diagnostic.
+                void* existing = st.editorWindow->getWindowHandle();
                 juce::DynamicObject::Ptr res(new juce::DynamicObject());
                 res->setProperty("hwnd", "0x" + juce::String::toHexString(
                                               (juce::int64)(uintptr_t)existing));
@@ -1010,15 +1057,27 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                         releaseEditorFlag(st);
                     }
                 });
+            // Become a foreground app before showing the window. A bare
+            // posix_spawn'd executable defaults to a background process on
+            // macOS (NSApplicationActivationPolicyProhibited) whose NSWindow
+            // won't show or take keyboard focus; makeForegroundProcess() does
+            // the activation-policy transform (no-op on Windows/Linux). The
+            // sandbox child owns a floating top-level window (Reaper-style) —
+            // the host does not reparent it.
+            juce::Process::makeForegroundProcess();
             st.editorWindow->setVisible(true);
-            HWND hwnd = (HWND)st.editorWindow->getWindowHandle();
+            void* hwnd = st.editorWindow->getWindowHandle();
+#if JUCE_WINDOWS
             wchar_t winsta[128] = L"?";
             DWORD winstaLen = 0;
             GetUserObjectInformationW(GetProcessWindowStation(), UOI_NAME,
                                       winsta, sizeof(winsta), &winstaLen);
             hostLogf("kOpenEditor: editor HWND=%p IsWindow=%d winsta=%ls",
-                     (void*)hwnd, hwnd != nullptr && IsWindow(hwnd) ? 1 : 0,
+                     hwnd, hwnd != nullptr && IsWindow((HWND)hwnd) ? 1 : 0,
                      winsta);
+#else
+            hostLogf("kOpenEditor: editor native handle=%p", hwnd);
+#endif
             if (hwnd == nullptr)
             {
                 // Native peer never came up (rare — class-registration
@@ -1277,6 +1336,18 @@ static void hostLogf(const char* fmt, ...)
     std::fflush(g_hostLog);
 }
 
+// RAII close for g_hostLog, shared by both platform entry points. Every early
+// `return N` below would otherwise leak the FILE* until process exit.
+struct HostLogCloser {
+    ~HostLogCloser() {
+        // Same mutex hostLogf takes so a future concurrent caller can't observe
+        // a half-torn-down g_hostLog (NULL-with-FILE-open / post-fclose dangle).
+        std::lock_guard<std::mutex> lock(g_hostLogMutex);
+        if (g_hostLog) { std::fclose(g_hostLog); g_hostLog = nullptr; }
+    }
+};
+
+#if JUCE_WINDOWS
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
     {
@@ -1337,18 +1408,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         if (g_hostLog)
             hostLogf("\n==== slopsmith-vst-host pid=%lu starting ====", pid);
     }
-    // RAII close for g_hostLog: every early `return N` below would otherwise
-    // leak the FILE* until process exit. The OS reaps it anyway, but making
-    // the lifetime explicit means future early-returns get it for free.
-    struct HostLogCloser {
-        ~HostLogCloser() {
-            // Same mutex hostLogf takes so a future concurrent caller can't
-            // observe a half-torn-down g_hostLog (NULL-with-FILE-still-open
-            // or post-fclose dangling pointer).
-            std::lock_guard<std::mutex> lock(g_hostLogMutex);
-            if (g_hostLog) { std::fclose(g_hostLog); g_hostLog = nullptr; }
-        }
-    } hostLogCloser;
+    HostLogCloser hostLogCloser;
 
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1358,6 +1418,33 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                  (unsigned long)GetLastError());
         return 1;
     }
+    // Normalise to a UTF-8 token list so the rest of the entry (scan check,
+    // parseArgs) is platform-agnostic; free the wide argv immediately.
+    juce::StringArray tokens;
+    for (int i = 0; i < argc; ++i) tokens.add(juce::String(argv[i]));
+    LocalFree(argv);
+#else
+int main(int argc, char** argv)
+{
+    {
+        // POSIX diagnostic log: $TMPDIR (or /tmp) + pid. A narrow UTF-8 fopen
+        // is correct here — POSIX paths are bytes, with none of the Windows
+        // ANSI-codepage lossiness that forced the wide-char dance above.
+        const char* tmp = ::getenv("TMPDIR");
+        const juce::File dir = (tmp != nullptr && *tmp != '\0')
+            ? juce::File(juce::String::fromUTF8(tmp)) : juce::File("/tmp");
+        const juce::File logFile = dir.getChildFile(
+            "slopsmith-vst-host-" + juce::String((int)::getpid()) + ".log");
+        g_hostLog = std::fopen(logFile.getFullPathName().toRawUTF8(), "w");
+        if (g_hostLog)
+            hostLogf("\n==== slopsmith-vst-host pid=%d starting ====",
+                     (int)::getpid());
+    }
+    HostLogCloser hostLogCloser;
+
+    juce::StringArray tokens;
+    for (int i = 0; i < argc; ++i) tokens.add(juce::String::fromUTF8(argv[i]));
+#endif
 
     // --scan-plugin mode is a separate, minimal code path that bypasses the
     // whole sandbox handshake (control pipe / audio shm / message loop). It's
@@ -1365,37 +1452,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // required-flag set and would reject the scan flags.
     {
         juce::String scanPlugin, scanOut;
-        for (int i = 1; i + 1 < argc; ++i)
+        for (int i = 1; i + 1 < tokens.size(); ++i)
         {
-            const juce::String key(argv[i]);
+            const juce::String key = tokens[i];
             // ++i to consume the value so it isn't re-examined as a key on the
             // next iteration (a plugin path is unlikely to collide with a flag
             // name, but skipping it keeps the parse unambiguous).
-            if (key == "--scan-plugin") { scanPlugin = juce::String(argv[++i]); }
-            else if (key == "--scan-out") { scanOut = juce::String(argv[++i]); }
+            if (key == "--scan-plugin") { scanPlugin = tokens[++i]; }
+            else if (key == "--scan-out") { scanOut = tokens[++i]; }
         }
         if (scanPlugin.isNotEmpty() || scanOut.isNotEmpty())
-        {
-            const int rc = runScanMode(scanPlugin, scanOut);
-            LocalFree(argv);
-            return rc;
-        }
+            return runScanMode(scanPlugin, scanOut);
     }
 
     Args parsed;
     juce::String parseFailReason;
-    if (!parseArgs(argc, argv, parsed, parseFailReason))
+    if (!parseArgs(tokens, parsed, parseFailReason))
     {
-        hostLogf("bad args (argc=%d): %s", argc, parseFailReason.toRawUTF8());
-        for (int i = 0; i < argc; ++i)
-        {
-            char buf[512]; std::snprintf(buf, sizeof(buf), "  argv[%d]=%ls", i, argv[i]);
-            hostLogf("%s", buf);
-        }
-        LocalFree(argv);
+        hostLogf("bad args (argc=%d): %s", tokens.size(),
+                 parseFailReason.toRawUTF8());
+        for (int i = 0; i < tokens.size(); ++i)
+            hostLogf("  argv[%d]=%s", i, tokens[i].toRawUTF8());
         return 2;
     }
-    LocalFree(argv);
     // Don't log the full pipe + shm + event names — they're the OS-level
     // kernel-object names an attacker reading our per-PID temp log
     // (`%TEMP%\slopsmith-vst-host-<pid>.log`, unconditional) could harvest
@@ -1405,11 +1484,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // numeric args carry no exfiltration value. Logging just the *length*
     // of the kernel-object names keeps the diagnostic useful (truncation
     // / empty cases visible) without leaking the literal name.
+#if JUCE_WINDOWS
     hostLogf("args ok: plugin=%s pipe=<%dchars> shm=<%dchars> sr=%d bs=%d ch=%d",
              parsed.pluginPath.toRawUTF8(),
              (int)parsed.controlPipe.length(),
              (int)parsed.audio.shm.length(),
              parsed.sampleRate, parsed.maxBlock, parsed.channels);
+#else
+    hostLogf("args ok: plugin=%s ctlfd=%d shmfd=%d evtfd=%d sr=%d bs=%d ch=%d",
+             parsed.pluginPath.toRawUTF8(),
+             parsed.controlFd, parsed.audio.shmFd, parsed.audio.sandboxAudioFd,
+             parsed.sampleRate, parsed.maxBlock, parsed.channels);
+#endif
 
     HostState st;
     st.sampleRate = parsed.sampleRate;
@@ -1423,7 +1509,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         return 3;
     }
     hostLogf("audio shm opened");
-    if (!st.control.connectClientSide(parsed.controlPipe, err))
+#if JUCE_WINDOWS
+    const bool controlConnected = st.control.connectClientSide(parsed.controlPipe, err);
+#else
+    const bool controlConnected = st.control.connectClientSideFd(parsed.controlFd, err);
+#endif
+    if (!controlConnected)
     {
         hostLogf("control pipe connect failed: %s", err.toRawUTF8());
         // No control thread to stop here (connect failed), but no
@@ -1474,12 +1565,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     // that is still loading. A genuinely stuck load is bounded instead by the
     // host-side absolute cap (kReadyAbsoluteTimeoutMs).
     //
-    // A std::jthread (not std::thread) so it auto-joins at scope exit with no
-    // explicit join() on the hot path: the thread exits as soon as loadDone is
-    // set — right after the load — so by the time WinMain unwinds, that join
-    // is always instant and never stalls the message thread waiting out an
-    // in-flight pipe write.
-    std::jthread heartbeatThread([&st, &loadDone]
+    // Plain std::thread (NOT std::jthread — Apple libc++ on older Xcode, e.g.
+    // the macOS CI runner, doesn't ship std::jthread). Joined explicitly right
+    // after the load pump below: the thread exits as soon as loadDone is set,
+    // so that join is always instant and never stalls the message thread
+    // waiting out an in-flight pipe write. The hard-exit path (stop during
+    // load) skips the join — TerminateProcess/_Exit ends every thread anyway.
+    std::thread heartbeatThread([&st, &loadDone]
     {
         constexpr int kHeartbeatSlices = 50;   // 50 * 100ms ≈ 5s between beats
         while (!loadDone.load(std::memory_order_acquire))
@@ -1513,11 +1605,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             if (mm->hasStopMessageBeenSent())
             {
                 hostLogf("stop requested during plugin load — terminating");
+#if JUCE_WINDOWS
                 TerminateProcess(GetCurrentProcess(), 5);
+#else
+                std::_Exit(5);   // immediate, skips atexit/static dtors
+#endif
                 return 5; // unreachable; documents the exit path
             }
         }
     }
+    // loadDone is set, so the heartbeat thread has exited (or is one 100 ms
+    // sleep slice from it) — join is effectively instant. Replaces std::
+    // jthread's scope-exit auto-join.
+    if (heartbeatThread.joinable()) heartbeatThread.join();
     st.plugin = std::move(loadedPlugin);
 
     if (!st.plugin)

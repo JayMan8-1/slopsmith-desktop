@@ -49,10 +49,31 @@ public:
     // after spawn.
     bool createServerSide(juce::String& pipeNameOut, juce::String& errorOut);
 
-    // Sandbox-side: connect to a pipe created by the host. Used by the
-    // slopsmith-vst-host subprocess. The host build also compiles this code
-    // (it lives in the same translation unit), but the addon doesn't call it.
+    // Sandbox-side: connect to a pipe created by the host. Windows only —
+    // the named pipe is re-opened by name. POSIX uses connectClientSideFd
+    // (the control transport is a fd-passed socketpair, not a named object).
     bool connectClientSide(const juce::String& pipeName, juce::String& errorOut);
+
+   #if ! JUCE_WINDOWS
+    // POSIX sandbox-side connect: adopt the inherited socketpair end (the fd
+    // the spawner dup2()'d into us, or — in an in-process loopback —
+    // server.sandboxFd()). Takes ownership of `fd`. The Windows
+    // connectClientSide(name) overload is unavailable on POSIX.
+    bool connectClientSideFd(int fd, juce::String& errorOut);
+
+    // POSIX host-side: the sandbox's end of the socketpair created by
+    // createServerSide. The caller owns it — dup2() it into the child (then
+    // close the copy) or hand it to an in-process connectClientSideFd.
+    // Returns -1 before createServerSide or on a non-server channel.
+    int sandboxFd() const noexcept;
+
+    // POSIX host-side: close our copy of the sandbox's socketpair end after a
+    // real spawn (the spawner has dup2()'d it into the child). REQUIRED — if
+    // the host keeps this open, the host end never observes EOF when the child
+    // dies, so crash detection never fires. No-op for the in-process loopback
+    // (connectClientSideFd already adopted the fd).
+    void closeSandboxFd() noexcept;
+   #endif
 
     // Start the background I/O thread. Must be called after either
     // createServerSide() or connectClientSide(). Returns false on error;
@@ -101,14 +122,23 @@ private:
 
     bool writeFrame(const juce::MemoryBlock& body);
     bool readFrame(juce::MemoryBlock& out);
+    // Server side: block until the sandbox connects (Windows: ConnectNamedPipe;
+    // POSIX: socketpair is already connected, so this just races the stop
+    // signal). Returns false if stop() fired first; `failReason` is set for
+    // failWith. Platform-defined.
+    bool waitForPeer(juce::String& failReason);
     void ioLoop();
     void failWith(const juce::String& reason);
 
     // Set by readFrame() before it returns false so ioLoop can classify the
-    // disconnect (ERROR_BROKEN_PIPE / ERROR_PIPE_NOT_CONNECTED / ERROR_NO_DATA
-    // → kReasonPeerClosed, anything else → kReasonReadError). Only the I/O
-    // thread writes or reads this field.
+    // disconnect. `lastReadError` is the raw OS error (Win32 GetLastError /
+    // POSIX errno) for diagnostics; `lastReadPeerClosed` is the
+    // platform-agnostic verdict ioLoop acts on (a clean peer-side close /
+    // EOF → kReasonPeerClosed, anything else → kReasonReadError) so the shared
+    // dispatch loop never has to know per-OS error codes. Only the I/O thread
+    // writes or reads these fields.
     unsigned long lastReadError = 0;
+    bool lastReadPeerClosed = false;
 
     struct Impl;
     std::unique_ptr<Impl> impl; // OS-specific handle wrapper

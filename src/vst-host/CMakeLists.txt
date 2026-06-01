@@ -1,15 +1,13 @@
-# Out-of-process VST helpers (optional targets; parent CMakeLists only
-# add_subdirectory() this folder on Windows and macOS).
+# Out-of-process VST helpers.
 #
-#   Windows — slopsmith-vst-host.exe: sandboxed VST3 host + --scan-plugin
-#   macOS   — slopsmith-vst-scan: VST3-only --scan-plugin probe (no sandbox yet)
-#   Linux   — not used; plugin scan/load stay in slopsmith_audio.node for now
+#   all platforms — slopsmith-vst-host(.exe): sandboxed VST3 host + --scan-plugin
+#   macOS (also)  — slopsmith-vst-scan: VST3-only --scan-plugin probe, still the
+#                   scan host VSTHost.cpp resolves on macOS (kept until the scan
+#                   path migrates to slopsmith-vst-host)
 #
 # Binaries are statically linked with JUCE so they can sit next to the addon.
-
-if(NOT WIN32 AND NOT APPLE)
-    return()
-endif()
+# Built on all three desktop platforms now that the POSIX sandbox runtime
+# (Slice 2) gives macOS/Linux a real slopsmith-vst-host child.
 
 # Shared JUCE wiring for both helpers: include path, link libs, compile defs,
 # and the per-config output dir so multi-config generators (VS / Xcode) don't
@@ -59,16 +57,38 @@ function(slopsmith_configure_vst_helper target app_name)
     )
 endfunction()
 
+# slopsmith-vst-host on every platform. The IPC channel backends are
+# platform-split (shared + win/posix); main.cpp builds as WinMain on Windows
+# and main() on POSIX (same file, #if-gated entry).
+set(VST_HOST_SOURCES
+    main.cpp
+    ../audio/VSTHost.cpp
+    ../audio/Sandbox/Protocol.cpp
+    ../audio/Sandbox/ControlChannel_shared.cpp
+    ../audio/Sandbox/AudioChannel_shared.cpp
+)
 if(WIN32)
-    add_executable(slopsmith-vst-host WIN32
-        main.cpp
-        ../audio/VSTHost.cpp
-        ../audio/Sandbox/Protocol.cpp
-        ../audio/Sandbox/ControlChannel.cpp
-        ../audio/Sandbox/AudioChannel.cpp
-    )
-    slopsmith_configure_vst_helper(slopsmith-vst-host SlopsmithVstHost)
+    list(APPEND VST_HOST_SOURCES
+        ../audio/Sandbox/ControlChannel_win.cpp
+        ../audio/Sandbox/AudioChannel_win.cpp)
+    add_executable(slopsmith-vst-host WIN32 ${VST_HOST_SOURCES})
+else()
+    list(APPEND VST_HOST_SOURCES
+        ../audio/Sandbox/ControlChannel_posix.cpp
+        ../audio/Sandbox/AudioChannel_posix.cpp)
+    add_executable(slopsmith-vst-host ${VST_HOST_SOURCES})
+endif()
+slopsmith_configure_vst_helper(slopsmith-vst-host SlopsmithVstHost)
 
+if(APPLE)
+    # CoreAudio/MIDI frameworks for JUCE audio + plugin hosting on macOS.
+    target_link_libraries(slopsmith-vst-host PRIVATE
+        "-framework CoreAudio" "-framework CoreMIDI" "-framework AudioUnit"
+        "-framework AudioToolbox" "-framework CoreAudioKit"
+        "-framework CoreFoundation" "-framework Accelerate")
+endif()
+
+if(WIN32)
     if(MSVC)
         # /EHa for SEH-aware catch in VSTHost.cpp (matches src/audio/CMakeLists.txt).
         target_compile_options(slopsmith-vst-host PRIVATE /EHa)

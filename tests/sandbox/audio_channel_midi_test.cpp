@@ -17,8 +17,7 @@
 
 #include <atomic>
 #include <cstdio>
-
-#include <windows.h>  // OpenFileMappingW / MapViewOfFile for HeaderPeek
+#include <thread>
 
 using namespace slopsmith::sandbox;
 
@@ -42,16 +41,6 @@ void check(bool cond, const char* what, const char* file, int line)
 // Use for everything that subsequent test lines dereference / depend on.
 #define REQUIRE(cond) \
     do { if (!(cond)) { check(false, #cond, __FILE__, __LINE__); return; } } while (0)
-
-// Reach into the shm header via the host's createHostSide-time mapping name
-// to read midiOverflows. Both ends of the AudioChannel point at the same
-// shared mapping, so any read off either side gives the same value — we use
-// the host instance for convenience.
-uint64_t readMidiOverflows(const AudioShmHeader* hdr)
-{
-    return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(hdr->midiOverflows))
-        .load(std::memory_order_relaxed);
-}
 
 // Helper: open a fresh host+sandbox AudioChannel pair with a given dims, run
 // a callback against both ends, then tear down. The pair is unique per call
@@ -88,35 +77,6 @@ struct ChannelPair
     }
 };
 
-// Re-open the shm mapping read-only to peek at AudioShmHeader directly.
-// Avoids bloating the public AudioChannel API with a header accessor that
-// only the test needs.
-struct HeaderPeek
-{
-    HANDLE mapping = nullptr;
-    void*  view = nullptr;
-    const AudioShmHeader* hdr = nullptr;
-
-    explicit HeaderPeek(const juce::String& shmName)
-    {
-        // FILE_MAP_READ is enough: std::atomic_ref<uint64_t> is always
-        // lock-free on x64 for naturally-aligned 8-byte fields, so the
-        // load() path here doesn't write through the mapping. Keep the
-        // mapping read-only to make the access intent explicit.
-        mapping = OpenFileMappingW(FILE_MAP_READ, FALSE,
-                                   shmName.toWideCharPointer());
-        if (!mapping) return;
-        view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0,
-                             sizeof(AudioShmHeader));
-        if (view) hdr = reinterpret_cast<const AudioShmHeader*>(view);
-    }
-    ~HeaderPeek()
-    {
-        if (view)    UnmapViewOfFile(view);
-        if (mapping) CloseHandle(mapping);
-    }
-};
-
 void testRoundtripSmallBuffer()
 {
     std::printf("test: roundtrip small MidiBuffer (count, frames, bytes)\n");
@@ -132,9 +92,7 @@ void testRoundtripSmallBuffer()
     midi.addEvent(juce::MidiMessage::controllerEvent(1, 7, 64), 64);
     midi.addEvent(juce::MidiMessage::noteOff(1, 60), 200);
 
-    HeaderPeek peek{pair.names.shm};
-    REQUIRE(peek.hdr != nullptr);
-    const uint64_t overflowsBefore = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsBefore = pair.host.diagMidiOverflows();
 
     REQUIRE(pair.host.pushInputBlock(srcAudio, midi, 256));
 
@@ -161,7 +119,7 @@ void testRoundtripSmallBuffer()
     CHECK((firstByte[2] & 0xF0) == 0x80);
 
     // No overflows expected on the happy path.
-    const uint64_t overflowsAfter = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsAfter = pair.host.diagMidiOverflows();
     CHECK(overflowsAfter == overflowsBefore);
 }
 
@@ -183,9 +141,7 @@ void testSysExBumpsOverflow()
     // Plus a normal CC event at frame 100 — should round-trip.
     midi.addEvent(juce::MidiMessage::controllerEvent(1, 7, 64), 100);
 
-    HeaderPeek peek{pair.names.shm};
-    REQUIRE(peek.hdr != nullptr);
-    const uint64_t overflowsBefore = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsBefore = pair.host.diagMidiOverflows();
 
     REQUIRE(pair.host.pushInputBlock(srcAudio, midi, 256));
 
@@ -197,7 +153,7 @@ void testSysExBumpsOverflow()
     for ([[maybe_unused]] const auto& meta : drained) ++n;
     CHECK(n == 1);  // SysEx dropped, CC survives.
 
-    const uint64_t overflowsAfter = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsAfter = pair.host.diagMidiOverflows();
     CHECK(overflowsAfter == overflowsBefore + 1);
 }
 
@@ -217,9 +173,7 @@ void testOverCapBumpsOverflow()
     for (int i = 0; i < total; ++i)
         midi.addEvent(juce::MidiMessage::controllerEvent(1, 7, i & 0x7F), i % 256);
 
-    HeaderPeek peek{pair.names.shm};
-    REQUIRE(peek.hdr != nullptr);
-    const uint64_t overflowsBefore = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsBefore = pair.host.diagMidiOverflows();
 
     REQUIRE(pair.host.pushInputBlock(srcAudio, midi, 256));
 
@@ -231,7 +185,7 @@ void testOverCapBumpsOverflow()
     for ([[maybe_unused]] const auto& meta : drained) ++n;
     CHECK(n == (int)kMidiEventsPerSlot);
 
-    const uint64_t overflowsAfter = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsAfter = pair.host.diagMidiOverflows();
     CHECK(overflowsAfter == overflowsBefore + (uint64_t)kExtra);
 }
 
@@ -254,9 +208,7 @@ void testFramePastSamplesDropped()
     midi.addEvent(juce::MidiMessage::noteOn(1, 62, (juce::uint8)100), 128);  // out-of-range (= samples)
     midi.addEvent(juce::MidiMessage::noteOn(1, 63, (juce::uint8)100), 200);  // out-of-range
 
-    HeaderPeek peek{pair.names.shm};
-    REQUIRE(peek.hdr != nullptr);
-    const uint64_t overflowsBefore = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsBefore = pair.host.diagMidiOverflows();
 
     REQUIRE(pair.host.pushInputBlock(srcAudio, midi, 128));
 
@@ -270,7 +222,7 @@ void testFramePastSamplesDropped()
     CHECK(n == 2);                    // events at 50 and 127
     CHECK(lastFrame == 127);          // 128 and 200 dropped, NOT clamped to 127
 
-    const uint64_t overflowsAfter = readMidiOverflows(peek.hdr);
+    const uint64_t overflowsAfter = pair.host.diagMidiOverflows();
     CHECK(overflowsAfter == overflowsBefore + 2);
 }
 
@@ -362,6 +314,88 @@ void testSlotReuseAcrossWraparound()
     }
 }
 
+void testThreadedProducerConsumer()
+{
+    // Cross-thread loopback: a producer thread pushes ordered blocks while a
+    // consumer thread drains them, both blocking on the real doorbell
+    // (Win32 auto-reset events / POSIX socketpair). This is the case the
+    // single-threaded tests above can't cover — the producer/consumer
+    // happens-before edge runs through the shared atomic write index plus the
+    // doorbell wake, and is what ThreadSanitizer actually inspects. Each block
+    // carries a unique audio marker + a varying MIDI count so a torn handoff,
+    // a dropped/duplicated block, or stale-slot MIDI would surface as a
+    // mismatch rather than passing silently.
+    std::printf("test: threaded producer/consumer over the doorbell\n");
+    AudioDimensions dims;                 // 4 blocks × 1024 samples × 2 ch
+    ChannelPair pair{dims};
+    REQUIRE(pair.ok);
+
+    constexpr int kBlocks = 4000;
+    const int samples = 256;
+    std::atomic<bool> producerOk{true};
+    std::atomic<int>  mismatches{0};
+
+    std::thread producer([&]
+    {
+        juce::AudioBuffer<float> src((int)dims.maxChannels, samples);
+        for (int i = 0; i < kBlocks; ++i)
+        {
+            // Unique per-block marker in sample 0 of every channel.
+            src.clear();
+            for (int ch = 0; ch < (int)dims.maxChannels; ++ch)
+                src.setSample(ch, 0, (float)i);
+
+            juce::MidiBuffer midi;
+            const int eventCount = i % 7;     // 0..6 events, < kMidiEventsPerSlot
+            for (int e = 0; e < eventCount; ++e)
+                midi.addEvent(juce::MidiMessage::controllerEvent(1, 7, e & 0x7F),
+                              e);             // frames 0..5 < samples
+
+            // The host audio thread would drop on a full ring (xrun); this
+            // test wants lossless ordering, so spin-retry until the consumer
+            // frees a slot. yield() keeps it from starving the consumer.
+            int spins = 0;
+            while (!pair.host.pushInputBlock(src, midi, samples))
+            {
+                std::this_thread::yield();
+                if (++spins > 50'000'000) { producerOk.store(false); return; }
+            }
+        }
+    });
+
+    juce::AudioBuffer<float> dst((int)dims.maxChannels, samples);
+    for (int i = 0; i < kBlocks; ++i)
+    {
+        juce::MidiBuffer drained;
+        // popInputBlock returns false on a coalesced / spurious doorbell wake
+        // (it rechecks the ring index, finds nothing new yet, and returns) —
+        // that is NOT a lost block, just "try again", exactly as the real
+        // runAudioThread loops. Retry until the real block arrives; the
+        // doorbell byte is sticky (socket-buffered) so there is no lost-wakeup
+        // window. A genuine stall (producer died) trips the bounded retry cap.
+        bool got = false;
+        for (int tries = 0; tries < 2'000'000 && !got; ++tries)
+        {
+            drained.clear();
+            got = pair.sandbox.popInputBlock(dst, drained, samples, 5000);
+            if (!got) std::this_thread::yield();
+        }
+        if (!got) { ++mismatches; break; }
+        if (dst.getSample(0, 0) != (float)i) ++mismatches;   // ordering / torn handoff
+        int n = 0;
+        for ([[maybe_unused]] const auto& meta : drained) ++n;
+        if (n != i % 7) ++mismatches;                         // stale-slot MIDI
+    }
+
+    producer.join();
+    CHECK(producerOk.load());
+    CHECK(mismatches.load() == 0);
+    // xruns are EXPECTED here: the spin-retry producer deliberately hammers a
+    // full ring (the real host audio thread would drop instead), so xruns
+    // climbing just means back-pressure worked — not asserted. What matters is
+    // that every block arrived exactly once, in order, with its MIDI intact.
+}
+
 } // namespace
 
 int main()
@@ -373,6 +407,7 @@ int main()
     testFramePastSamplesDropped();
     testNumSamplesOverCapRejected();
     testSlotReuseAcrossWraparound();
+    testThreadedProducerConsumer();
     std::printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

@@ -2007,12 +2007,12 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
     // torn down) between this call returning and the async firing.
     // Return optimistically; matches the in-process path below.
     //
-    // SandboxedProcessor (and its typeinfo, isAlive/requestOpenEditor symbols)
-    // is only compiled on Windows — see src/audio/CMakeLists.txt. Off Windows
-    // the stub factory never creates one, so this branch is dead; guarding it
-    // out also keeps the addon's .node free of references to Windows-only
-    // symbols, which would otherwise fail dlopen on macOS/Linux.
-#if JUCE_WINDOWS && defined(SLOPSMITH_AUDIO_ADDON)
+    // SandboxedProcessor is compiled on all desktop platforms now (the POSIX
+    // sandbox runtime is active — see src/audio/CMakeLists.txt), so the
+    // editor-open IPC routes to the sandbox child on macOS/Linux too. The
+    // child owns a floating editor window (Reaper-style); the host only tracks
+    // the open/closed bit.
+#if defined(SLOPSMITH_AUDIO_ADDON)
     if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
     {
         // Synchronous gate: if the sandbox child is already gone (crashed
@@ -2107,11 +2107,10 @@ static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
     // re-resolve guards against slot-removal UAF between the napi call
     // and the async firing.
     //
-    // Windows-only branch: SandboxedProcessor and requestCloseEditor() are
-    // compiled only on Windows. Off Windows there are no sandboxed plugins, so
-    // fall through to the in-process editor-window teardown below. Guarding
-    // this out keeps the .node free of Windows-only symbols (see OpenPluginEditor).
-#if JUCE_WINDOWS && defined(SLOPSMITH_AUDIO_ADDON)
+    // All desktop platforms: route the close to the sandbox child via IPC
+    // (SandboxedProcessor is compiled everywhere now). In-process plugins fall
+    // through to the host-side editor-window teardown below.
+#if defined(SLOPSMITH_AUDIO_ADDON)
     if (auto liveEngine = snapshotEngine())
     {
         if (auto* slot = liveEngine->getSignalChain().getSlot(slotId))

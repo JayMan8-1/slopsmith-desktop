@@ -1,0 +1,146 @@
+// Sandbox factory — platform-neutral routing policy.
+//
+// Decides whether a plugin loads through the out-of-process sandbox and, if so,
+// constructs a SandboxedProcessor. Only resolveSandboxExe() (locating the
+// slopsmith-vst-host binary next to the addon) is platform-specific — it lives
+// in SandboxFactory_{win,posix}.cpp.
+
+#include "SandboxedProcessor.h"
+#include "../VSTTrace.h"
+
+#include <juce_core/juce_core.h>
+#include <cmath>      // std::isfinite, std::lround
+#include <limits>     // std::numeric_limits
+#include <mutex>      // guards the runtime crash blocklist
+
+namespace slopsmith::sandbox {
+
+namespace {
+
+// Historical pre-seed of plugins known to fail in-process. With the
+// sandbox-by-default policy in shouldSandbox() below, every VST3 routes to the
+// sandbox regardless of this list, so it no longer determines routing on its
+// own. It survives as (a) documentation of *why* each plugin originally needed
+// the sandbox, (b) diagnostic tagging in shouldSandbox's VST_TRACE output, and
+// (c) forward-looking infrastructure for a future per-plugin opt-out.
+const juce::StringArray kDefaultNeedsSandboxFilenames = {
+    "Guitar Rig",
+    "Graphene",
+    "TONEX",
+    "AmpliTube",
+};
+
+// Runtime crash blocklist: full plugin paths that crashed the app on a previous
+// run, supplied by the renderer's VST crash guard via setCrashedPlugins().
+std::mutex g_crashedPluginsMutex;
+juce::StringArray g_crashedPlugins;
+
+} // anonymous
+
+// Routing policy: every VST3 plugin loads via the out-of-process sandbox.
+// Non-VST3 processors (NAM, IR) stay in-process. (See the long rationale in the
+// git history / docs: plugins assume the host's message thread is the OS main
+// thread with STA COM — which the sandbox child provides and Electron's
+// background JUCE thread does not.)
+bool shouldSandbox(const juce::PluginDescription& desc)
+{
+    const auto path = juce::File(desc.fileOrIdentifier);
+
+    // VST3 only: non-VST3 processors (NAM models, IRs) keep loading in-process.
+    if (!path.getFileName().endsWithIgnoreCase(".vst3"))
+        return false;
+
+    // Runtime crash blocklist — diagnostic tagging only under sandbox-by-default.
+    {
+        const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
+        const auto canonical = path.getFullPathName();
+        if (g_crashedPlugins.contains(canonical, /*ignoreCase*/ true))
+        {
+            VST_TRACE("shouldSandbox: %s — on the runtime crash blocklist",
+                      desc.fileOrIdentifier.toRawUTF8());
+            return true;
+        }
+    }
+
+    // Pre-seed filename match — diagnostic tagging only.
+    const auto basename = path.getFileNameWithoutExtension();
+    for (auto& needle : kDefaultNeedsSandboxFilenames)
+    {
+        if (basename.startsWithIgnoreCase(needle))
+        {
+            VST_TRACE("shouldSandbox: %s — filename starts with '%s'",
+                      desc.fileOrIdentifier.toRawUTF8(), needle.toRawUTF8());
+            return true;
+        }
+    }
+
+    VST_TRACE("shouldSandbox: %s — default policy (every VST3 sandboxes)",
+              desc.fileOrIdentifier.toRawUTF8());
+    return true;
+}
+
+std::unique_ptr<juce::AudioProcessor> tryLoadSandboxed(
+    const juce::PluginDescription& desc,
+    double sampleRate, int blockSize,
+    juce::String& errorOut)
+{
+    if (!shouldSandbox(desc))
+        return nullptr;
+
+    auto exe = resolveSandboxExe();
+    if (!exe.existsAsFile())
+    {
+        errorOut = "slopsmith-vst-host not found";
+        return nullptr;
+    }
+
+    // Validate sampleRate before narrowing to uint32_t — `(uint32_t)NaN` is UB
+    // and silently accepting 0 / negative / overflow makes a bad caller surface
+    // as a late sandbox-spawn failure instead of a clear errorOut here.
+    if (! std::isfinite(sampleRate) || sampleRate <= 0.0
+        || sampleRate > (double)(std::numeric_limits<uint32_t>::max)())
+    {
+        errorOut = "invalid sampleRate: " + juce::String(sampleRate);
+        return nullptr;
+    }
+
+    SandboxedProcessor::SpawnConfig cfg;
+    cfg.pluginPath = desc.fileOrIdentifier;
+    cfg.pluginName = desc.name.isNotEmpty() ? desc.name : "plugin";
+    cfg.sandboxExePath = exe.getFullPathName();
+    cfg.audio.sampleRate = (uint32_t)std::lround(sampleRate);
+    // Clamp to the protocol cap: vst-host's kPrepare rejects blockSize
+    // > kAudioMaxBlockSamples, so spawning a larger shm layout would later fail
+    // the prepare round-trip rather than silently misbehave.
+    cfg.audio.maxBlockSamples = (uint32_t)juce::jlimit(
+        64, (int)kAudioMaxBlockSamples, blockSize);
+    cfg.audio.maxChannels = 2;
+    cfg.audio.maxBlocks = kAudioMaxBlocks;
+
+    return SandboxedProcessor::spawn(cfg, errorOut);
+}
+
+void addCrashedPlugin(const juce::String& pluginPath)
+{
+    if (pluginPath.isEmpty()) return;
+    const auto canonical = juce::File(pluginPath).getFullPathName();
+    const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
+    if (! g_crashedPlugins.contains(canonical, /*ignoreCase*/ true))
+    {
+        g_crashedPlugins.add(canonical);
+        VST_TRACE("addCrashedPlugin: %s appended to runtime crash blocklist",
+                  canonical.toRawUTF8());
+    }
+}
+
+void setCrashedPlugins(const juce::StringArray& pluginPaths)
+{
+    const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
+    g_crashedPlugins.clearQuick();
+    for (const auto& p : pluginPaths)
+        g_crashedPlugins.add(p.isNotEmpty() ? juce::File(p).getFullPathName() : p);
+    VST_TRACE("setCrashedPlugins: %d plugin(s) on the runtime crash blocklist",
+              g_crashedPlugins.size());
+}
+
+} // namespace slopsmith::sandbox

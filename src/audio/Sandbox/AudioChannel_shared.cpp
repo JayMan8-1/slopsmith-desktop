@@ -1,330 +1,69 @@
-#include "AudioChannel.h"
+// AudioChannel — platform-neutral lock-free ring logic.
+//
+// The shared-memory layout (Protocol.h / AudioShmHeader), the producer/
+// consumer index discipline, and the inline-MIDI packing are identical on
+// every OS. Only the shared-memory create/open/close and the doorbell
+// signal/wait differ, and those live behind AudioChannel::Impl::signalEvent /
+// waitEvent + the create/open/close trio in AudioChannel_{win,posix}.cpp.
+//
+// Threading: see AudioChannel.h. The release-store on a write index pairs with
+// the consumer's acquire-load of the same index, which is what makes the plain
+// memcpy/memset slot writes visible to the consumer — release/acquire on the
+// shared atomic establishes happens-before regardless of architecture
+// (x86/x64 and arm64 alike), and across the process boundary because both
+// sides map the same physical memory.
+
+#include "AudioChannelImpl.h"
 #include "../VSTTrace.h"
 
-#if JUCE_WINDOWS
- #include <windows.h>
-#else
- #error "AudioChannel.cpp is Windows-only for now."
-#endif
+#include <atomic>
+#include <cstring>
 
 namespace slopsmith::sandbox {
-
-struct AudioChannel::Impl
-{
-    HANDLE mapping = nullptr;
-    void*  view = nullptr;
-    HANDLE evtToHost = nullptr;
-    HANDLE evtToSandbox = nullptr;
-    AudioShmHeader* header = nullptr;
-    float* inputRing = nullptr;   // host writes, sandbox reads
-    float* outputRing = nullptr;  // sandbox writes, host reads
-    MidiQueue* midiQueues = nullptr; // [maxBlocks], one per input slot
-};
 
 AudioChannel::AudioChannel() : impl(std::make_unique<Impl>()) {}
 
 AudioChannel::~AudioChannel() { close(); }
 
-static juce::String makeUniqueName(const char* suffix)
-{
-    return "Local\\slopsmith-vst-" + juce::Uuid().toDashedString() + "-" + suffix;
-}
-
-bool AudioChannel::createHostSide(const AudioDimensions& dims, Names& namesOut,
-                                  juce::String& errorOut)
-{
-    namesOut.shm          = makeUniqueName(kShmNameSuffix);
-    namesOut.evtToHost    = makeUniqueName(kEvtToHostSuffix);
-    namesOut.evtToSandbox = makeUniqueName(kEvtToSandboxSuffix);
-
-    auto totalBytes = dims.totalShmBytes();
-    impl->mapping = CreateFileMappingW(
-        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-        (DWORD)(totalBytes >> 32), (DWORD)(totalBytes & 0xFFFFFFFFu),
-        namesOut.shm.toWideCharPointer());
-    if (impl->mapping == nullptr)
-    {
-        errorOut = "CreateFileMapping failed: " + juce::String((int)GetLastError());
-        close();
-        return false;
-    }
-    impl->view = MapViewOfFile(impl->mapping, FILE_MAP_ALL_ACCESS, 0, 0, totalBytes);
-    if (!impl->view)
-    {
-        errorOut = "MapViewOfFile failed";
-        close();
-        return false;
-    }
-    impl->header = reinterpret_cast<AudioShmHeader*>(impl->view);
-
-    // Initialise the header on the host side.
-    impl->header->magic = kAudioShmMagic;
-    impl->header->protocolVersion = kProtocolVersion;
-    impl->header->maxBlocks = dims.maxBlocks;
-    impl->header->maxBlockSamples = dims.maxBlockSamples;
-    impl->header->maxChannels = dims.maxChannels;
-    impl->header->sampleRate = dims.sampleRate;
-    impl->header->inWriteIdx  = 0;
-    impl->header->inReadIdx   = 0;
-    impl->header->outWriteIdx = 0;
-    impl->header->outReadIdx  = 0;
-    impl->header->xruns = 0;
-    impl->header->dropouts = 0;
-    impl->header->midiOverflows = 0;
-    impl->header->ringBytesPerSlot = dims.bytesPerSlot();
-    impl->header->inputRingOffset  = sizeof(AudioShmHeader);
-    impl->header->outputRingOffset = impl->header->inputRingOffset
-                                   + uint64_t(dims.maxBlocks) * dims.bytesPerSlot();
-    impl->header->midiQueueOffset  = impl->header->outputRingOffset
-                                   + uint64_t(dims.maxBlocks) * dims.bytesPerSlot();
-
-    // Release fence so all the header writes above are visible before the
-    // sandbox observes the mapping. CreateProcessW (the publish point on
-    // the host side) is a strong synchronisation primitive on Windows, so
-    // in practice the writes are already flushed before the child starts —
-    // but the fence makes the spawn-order invariant documented in
-    // openSandboxSide explicit at the producer rather than relying on the
-    // implicit semantics of the spawn call.
-    std::atomic_thread_fence(std::memory_order_release);
-
-    auto* base = reinterpret_cast<char*>(impl->view);
-    impl->inputRing  = reinterpret_cast<float*>(base + impl->header->inputRingOffset);
-    impl->outputRing = reinterpret_cast<float*>(base + impl->header->outputRingOffset);
-    impl->midiQueues = reinterpret_cast<MidiQueue*>(base + impl->header->midiQueueOffset);
-    // Zero-initialise the per-slot MidiQueues so a producer's first publish
-    // doesn't have to clear count/overflow bookkeeping.
-    std::memset(impl->midiQueues, 0,
-                sizeof(MidiQueue) * (size_t)dims.maxBlocks);
-
-    impl->evtToHost = CreateEventW(
-        nullptr, /*manualReset*/FALSE, /*initial*/FALSE,
-        namesOut.evtToHost.toWideCharPointer());
-    impl->evtToSandbox = CreateEventW(
-        nullptr, FALSE, FALSE,
-        namesOut.evtToSandbox.toWideCharPointer());
-    if (!impl->evtToHost || !impl->evtToSandbox)
-    {
-        errorOut = "CreateEvent failed";
-        close();
-        return false;
-    }
-    cachedDims = dims;
-    return true;
-}
-
-bool AudioChannel::openSandboxSide(const Names& names, juce::String& errorOut)
-{
-    impl->mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
-                                     names.shm.toWideCharPointer());
-    if (!impl->mapping)
-    {
-        errorOut = "OpenFileMapping failed: " + juce::String((int)GetLastError());
-        close();
-        return false;
-    }
-    impl->view = MapViewOfFile(impl->mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-    if (!impl->view)
-    {
-        errorOut = "MapViewOfFile (sandbox) failed";
-        close();
-        return false;
-    }
-    // Before the magic check (which reads header->magic), verify the mapping
-    // is at least sizeof(AudioShmHeader). `MapViewOfFile(...,0)` maps the
-    // whole object, but if a corrupted/malicious named-mapping pointed at a
-    // smaller object the magic check itself would be an OOB read. The
-    // expectedTotal bounds check below uses header-derived fields and so
-    // cannot detect an undersized real mapping — this is the only place we
-    // can close that gap.
-    {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(impl->view, &mbi, sizeof(mbi)) == 0
-            || mbi.RegionSize < sizeof(AudioShmHeader))
-        {
-            errorOut = "audio shm mapping too small for header ("
-                     + juce::String((int64_t)mbi.RegionSize) + " < "
-                     + juce::String((int64_t)sizeof(AudioShmHeader)) + ")";
-            close();
-            return false;
-        }
-    }
-    impl->header = reinterpret_cast<AudioShmHeader*>(impl->view);
-    if (impl->header->magic != kAudioShmMagic)
-    {
-        errorOut = "audio shm magic mismatch";
-        close();
-        return false;
-    }
-    if (impl->header->protocolVersion != kProtocolVersion)
-    {
-        errorOut = "audio shm protocol mismatch: expected "
-                 + juce::String((int)kProtocolVersion) + ", got "
-                 + juce::String((int)impl->header->protocolVersion);
-        close();
-        return false;
-    }
-    // Validate dims against compile-time caps BEFORE computing bytesPerSlot()
-    // and expectedTotal. Without this, pathological header values (corrupted
-    // or malicious mapping that passed magic+protocolVersion) can overflow
-    // uint64_t in `maxBlockSamples * maxChannels * 4` or
-    // `2 * maxBlocks * ringBytesPerSlot`, defeating the inEnd/outEnd bounds
-    // check below and pointing inputRing/outputRing past the actual mapping.
-    // Host-side spawn validates these at SandboxedProcessor::spawn but the
-    // sandbox side has been trusting whatever the mapping says.
-    if (impl->header->maxBlocks == 0 || impl->header->maxBlocks > kAudioMaxBlocks
-        || impl->header->maxBlockSamples == 0
-        || impl->header->maxBlockSamples > kAudioMaxBlockSamples
-        || impl->header->maxChannels == 0
-        || impl->header->maxChannels > kAudioMaxChannels)
-    {
-        errorOut = "audio shm dims exceed protocol caps: blocks="
-                 + juce::String((int64_t)impl->header->maxBlocks)
-                 + " blockSamples=" + juce::String((int64_t)impl->header->maxBlockSamples)
-                 + " channels=" + juce::String((int64_t)impl->header->maxChannels);
-        close();
-        return false;
-    }
-    cachedDims.maxBlocks = impl->header->maxBlocks;
-    cachedDims.maxBlockSamples = impl->header->maxBlockSamples;
-    cachedDims.maxChannels = impl->header->maxChannels;
-    cachedDims.sampleRate = impl->header->sampleRate;
-
-    // Cross-check ringBytesPerSlot against the dims the host published. A
-    // mismatch here would silently produce misaligned ring access — the
-    // protocol version check upstream already guarantees host/sandbox
-    // agree on the layout, this just makes the contract local.
-    const uint64_t expectedSlotBytes = cachedDims.bytesPerSlot();
-    if (impl->header->ringBytesPerSlot != expectedSlotBytes)
-    {
-        errorOut = "audio shm ringBytesPerSlot mismatch: expected "
-                 + juce::String((int64_t)expectedSlotBytes) + ", got "
-                 + juce::String((int64_t)impl->header->ringBytesPerSlot);
-        close();
-        return false;
-    }
-
-    // Spawn-order invariant: the host fully initialises the shared header
-    // (sets magic, protocolVersion, maxBlocks, etc.) BEFORE calling
-    // CreateProcessW, so by the time the sandbox observes the mapping the
-    // header is fully populated. If a future refactor lets the sandbox map
-    // the view before host-side init completes, add explicit
-    // synchronisation (atomic seq counter, or an event signalled after
-    // init) — without it the sandbox could observe partial fields.
-
-    // Sandbox side maps the view with size=0, which means "whole object".
-    // We don't know the OS-reported view size, but we can reconstruct the
-    // expected total from the validated dims and bounds-check the offsets
-    // against that. Anything beyond would be a stale/incompatible host
-    // header that survived magic+version validation (unlikely but cheap
-    // to catch — and the alternative is an out-of-bounds memcpy on the
-    // first push/popBlock or popInputBlock MIDI drain).
-    const uint64_t expectedTotal = sizeof(AudioShmHeader)
-        + 2 * uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot
-        + uint64_t(impl->header->maxBlocks) * sizeof(MidiQueue);
-    const uint64_t inEnd  = impl->header->inputRingOffset
-        + uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot;
-    const uint64_t outEnd = impl->header->outputRingOffset
-        + uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot;
-    const uint64_t midiEnd = impl->header->midiQueueOffset
-        + uint64_t(impl->header->maxBlocks) * sizeof(MidiQueue);
-    // Bounds check: each region must fit within the mapping. Ordering
-    // check: regions must not overlap each other or the header. A
-    // malformed host header that satisfies magic + version + caps but
-    // reports e.g. midiQueueOffset == inputRingOffset would otherwise
-    // pass bounds yet silently corrupt audio/MIDI on every block. The
-    // canonical layout from createHostSide is: [header][input][output][midi].
-    if (inEnd > expectedTotal
-        || outEnd > expectedTotal
-        || midiEnd > expectedTotal
-        || impl->header->inputRingOffset  < sizeof(AudioShmHeader)
-        || impl->header->outputRingOffset < inEnd
-        || impl->header->midiQueueOffset  < outEnd)
-    {
-        errorOut = "audio shm ring/MIDI offsets out of bounds or overlapping";
-        close();
-        return false;
-    }
-    // Now that we know what the header *claims* the object should be, verify
-    // the actual mapped region is at least that big. The earlier VirtualQuery
-    // covered just sizeof(AudioShmHeader); a stale/foreign mapping that
-    // reused the same name with a smaller backing object would pass magic +
-    // protocolVersion + dim-cap checks and still let the first pushBlock /
-    // popBlock memcpy outside the mapping.
-    {
-        MEMORY_BASIC_INFORMATION mbi2{};
-        if (VirtualQuery(impl->view, &mbi2, sizeof(mbi2)) == 0
-            || mbi2.RegionSize < expectedTotal)
-        {
-            errorOut = "audio shm mapping too small for ring layout: region="
-                     + juce::String((int64_t)mbi2.RegionSize) + " expected>="
-                     + juce::String((int64_t)expectedTotal);
-            close();
-            return false;
-        }
-    }
-
-    auto* base = reinterpret_cast<char*>(impl->view);
-    impl->inputRing  = reinterpret_cast<float*>(base + impl->header->inputRingOffset);
-    impl->outputRing = reinterpret_cast<float*>(base + impl->header->outputRingOffset);
-    impl->midiQueues = reinterpret_cast<MidiQueue*>(base + impl->header->midiQueueOffset);
-
-    impl->evtToHost    = OpenEventW(EVENT_ALL_ACCESS, FALSE,
-                                    names.evtToHost.toWideCharPointer());
-    impl->evtToSandbox = OpenEventW(EVENT_ALL_ACCESS, FALSE,
-                                    names.evtToSandbox.toWideCharPointer());
-    if (!impl->evtToHost || !impl->evtToSandbox)
-    {
-        errorOut = "OpenEvent failed: " + juce::String((int)GetLastError());
-        close();
-        return false;
-    }
-    return true;
-}
-
-void AudioChannel::close()
-{
-    if (impl->evtToHost)    { CloseHandle(impl->evtToHost);    impl->evtToHost = nullptr; }
-    if (impl->evtToSandbox) { CloseHandle(impl->evtToSandbox); impl->evtToSandbox = nullptr; }
-    if (impl->view)         { UnmapViewOfFile(impl->view);     impl->view = nullptr; }
-    if (impl->mapping)      { CloseHandle(impl->mapping);      impl->mapping = nullptr; }
-    impl->header = nullptr;
-    impl->inputRing = nullptr;
-    impl->outputRing = nullptr;
-    impl->midiQueues = nullptr;
-}
-
-// std::atomic_ref needs C++20 (P0019, finalised in libstdc++ 11+ and recent
-// MSVC). The repo's CMAKE_CXX_STANDARD is set to 20, but a contributor
-// building this TU under an older toolchain would get a confusing template
-// lookup error rather than a clear "your compiler is too old" message —
-// the feature-test macro converts that into a fast compile-time signal.
-#ifndef __cpp_lib_atomic_ref
-#  error "std::atomic_ref<uint64_t> requires C++20 + libstdc++ 11+ / recent MSVC; \
-upgrade the toolchain or guard this file behind an alternate atomic strategy."
-#endif
-
-// Header indices are written by the host side and read by the sandbox side
-// over shared memory. std::atomic_ref gives us atomic access without UB from
-// reinterpret_casting the uint64_t storage to std::atomic<uint64_t>* (the
-// latter relies on layout-compatibility C++ doesn't promise).
-// `atomic_ref<T>::required_alignment` may exceed `alignof(T)` on some
-// platforms; header fields are `alignas(8) uint64_t`. The static_assert
-// below fails at compile time on a platform where required_alignment > 8
-// rather than producing UB at runtime — bump the alignas to match if it
-// ever trips.
+// Atomic access to the plain uint64_t/uint32_t shm header indices (written by
+// one side, read by the other across the process boundary). We avoid UB from
+// reinterpret_cast'ing the storage to std::atomic<T>* (not layout-guaranteed)
+// in one of two ways:
+//
+//   * std::atomic_ref<T> (C++20, P0019) where the library provides it — MSVC,
+//     libstdc++ 11+, libc++ 19+ (Apple clang / Xcode 16+).
+//   * the gcc/clang __atomic builtins otherwise — notably older Apple libc++
+//     (pre-Xcode-16 macOS runners) which lacks std::atomic_ref. Same lock-free
+//     acquire/release semantics on the caller-aligned object. This branch uses
+//     gcc/clang-only builtins; it is never compiled on MSVC, which always has
+//     std::atomic_ref. (SLOPSMITH_FORCE_ATOMIC_BUILTINS forces it for testing.)
+#if defined(__cpp_lib_atomic_ref) && ! defined(SLOPSMITH_FORCE_ATOMIC_BUILTINS)
+// `atomic_ref<T>::required_alignment` may exceed `alignof(T)`; header fields
+// are `alignas(8)`. Fail at compile time if a platform needs more, rather than
+// constructing an atomic_ref on an under-aligned object (UB).
 static_assert(std::atomic_ref<uint64_t>::required_alignment <= 8,
               "AudioShmHeader uint64_t fields are alignas(8); bump the "
-              "alignas to std::atomic_ref<uint64_t>::required_alignment "
-              "or atomic_ref construction is undefined behavior");
-static std::atomic_ref<uint64_t> atomicAt(uint64_t& slot)
+              "alignas to std::atomic_ref<uint64_t>::required_alignment");
+template <typename T>
+static std::atomic_ref<T> atomicRefOf(T& slot) { return std::atomic_ref<T>(slot); }
+#else
+// std::memory_order's enumerator values match the __ATOMIC_* constants on
+// gcc/clang, so the cast is exact.
+template <typename T>
+struct BuiltinAtomicRef
 {
-    return std::atomic_ref<uint64_t>(slot);
-}
+    T* p;
+    explicit BuiltinAtomicRef(T& r) : p(&r) {}
+    T    load(std::memory_order o) const { return __atomic_load_n(p, static_cast<int>(o)); }
+    void store(T v, std::memory_order o) { __atomic_store_n(p, v, static_cast<int>(o)); }
+    T    fetch_add(T v, std::memory_order o) { return __atomic_fetch_add(p, v, static_cast<int>(o)); }
+};
+template <typename T>
+static BuiltinAtomicRef<T> atomicRefOf(T& slot) { return BuiltinAtomicRef<T>(slot); }
+#endif
 
-static std::atomic_ref<uint32_t> atomicAt32(uint32_t& slot)
-{
-    return std::atomic_ref<uint32_t>(slot);
-}
+static auto atomicAt(uint64_t& slot)   { return atomicRefOf(slot); }
+static auto atomicAt32(uint32_t& slot) { return atomicRefOf(slot); }
 
 namespace
 {
@@ -364,11 +103,6 @@ bool AudioChannel::pushBlock(bool isOutputRing, const juce::AudioBuffer<float>& 
     uint64_t r = readIdx.load(std::memory_order_acquire);
     if (w - r >= impl->header->maxBlocks)
     {
-        // v1 shared writeIdx/readIdx pair means this counter is shared
-        // across both rings — a host-side input-push xrun and a sandbox-
-        // side output-push xrun both increment the same value. PR #2's
-        // per-direction indices split will give us per-ring counters so
-        // diagnosis can pin back-pressure to the upstream side.
         atomicAt(impl->header->xruns).fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -397,17 +131,13 @@ bool AudioChannel::pushBlock(bool isOutputRing, const juce::AudioBuffer<float>& 
         std::memset(dst + ch * maxSamples, 0,
                     sizeof(float) * (size_t)maxSamples);
 
-    // The release store on writeIdx pairs with the consumer's acquire load
-    // in popBlock, so the slot memcpy/memset above are happens-before any
-    // read of writeIdx >= w+1. On x86/x64 (today's only target) plain
-    // memory ops are ordered enough that this pairing alone is sufficient.
-    // On the deferred macOS/Linux ports — and ARM specifically — slot
-    // writes happen via plain memcpy/memset (not atomic) and weakly
-    // ordered architectures may need an explicit `atomic_thread_fence
-    // (memory_order_release)` immediately before the store. Track with
-    // the macOS/Linux sandbox follow-up PRs.
+    // The release store on writeIdx pairs with the consumer's acquire load in
+    // popBlock, so the slot memcpy/memset above are happens-before any read of
+    // writeIdx >= w+1 — on every supported architecture (the pairing, not the
+    // hardware, is what guarantees it). signalEvent is only a wakeup; the
+    // actual data handoff is the index + shm.
     writeIdx.store(w + 1, std::memory_order_release);
-    SetEvent(isOutputRing ? impl->evtToHost : impl->evtToSandbox);
+    impl->signalEvent(isOutputRing);
     return true;
 }
 
@@ -415,20 +145,20 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
                             int numSamples, int timeoutMs)
 {
     if (!impl->header) return false;
-    HANDLE evt = isOutputRing ? impl->evtToHost : impl->evtToSandbox;
     auto idx = indicesFor(*impl->header, isOutputRing);
     auto writeIdx = atomicAt(idx.write);
     auto readIdx  = atomicAt(idx.read);
 
-    // Check indices BEFORE waiting. SetEvent on an auto-reset event is not
-    // counting: if the producer signals twice in a row (queue 2 blocks),
-    // both signals collapse to one wake. Without this fast path, the
-    // consumer would block on the second pop even though w > r already.
+    // Check indices BEFORE waiting. The doorbell is not counting: if the
+    // producer signals twice in a row (queue 2 blocks), the wakes collapse
+    // (Win32 auto-reset event) or are drained together (POSIX socketpair).
+    // Without this fast path, the consumer would block on the second pop even
+    // though w > r already.
     uint64_t r = readIdx.load(std::memory_order_relaxed);
     uint64_t w = writeIdx.load(std::memory_order_acquire);
     if (w == r)
     {
-        if (WaitForSingleObject(evt, timeoutMs) != WAIT_OBJECT_0)
+        if (!impl->waitEvent(isOutputRing, timeoutMs))
         {
             atomicAt(impl->header->dropouts).fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -439,9 +169,8 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
         // disconnect callback. NONE of those are dropouts — they're
         // intentional non-data wakes. Don't bump `dropouts` here or the
         // counter pollutes every pause-guarded control op. Real
-        // dropouts are still counted on the WaitForSingleObject
-        // timeout path above and at the SandboxedProcessor pop-timeout
-        // call site.
+        // dropouts are still counted on the waitEvent timeout path above
+        // and at the SandboxedProcessor pop-timeout call site.
         r = readIdx.load(std::memory_order_relaxed);
         w = writeIdx.load(std::memory_order_acquire);
         if (w == r) return false;
@@ -643,7 +372,7 @@ bool AudioChannel::pushInputBlock(const juce::AudioBuffer<float>& src,
     //    on inWriteIdx in popInputBlock, which makes both the audio bytes
     //    and the MIDI queue visible together.
     writeIdx.store(w + 1, std::memory_order_release);
-    SetEvent(impl->evtToSandbox);
+    impl->signalEvent(/*isOutputRing*/ false);
     return true;
 }
 
@@ -672,18 +401,17 @@ bool AudioChannel::popInputBlock(juce::AudioBuffer<float>& dst,
     if (numSamples > (int)impl->header->maxBlockSamples)
         return false;
 
-    HANDLE evt = impl->evtToSandbox;
     auto writeIdx = atomicAt(impl->header->inWriteIdx);
     auto readIdx  = atomicAt(impl->header->inReadIdx);
 
-    // Same fast-path / wait / recheck pattern as popBlock: SetEvent on an
-    // auto-reset event collapses signals, so if pushInputBlock fires twice
-    // in a row we'd otherwise block on the second pop even though w > r.
+    // Same fast-path / wait / recheck pattern as popBlock: the doorbell
+    // collapses/coalesces signals, so if pushInputBlock fires twice in a row
+    // we'd otherwise block on the second pop even though w > r.
     uint64_t r = readIdx.load(std::memory_order_relaxed);
     uint64_t w = writeIdx.load(std::memory_order_acquire);
     if (w == r)
     {
-        if (WaitForSingleObject(evt, timeoutMs) != WAIT_OBJECT_0)
+        if (!impl->waitEvent(/*isOutputRing*/ false, timeoutMs))
         {
             atomicAt(impl->header->dropouts).fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -743,19 +471,33 @@ bool AudioChannel::popInputBlock(juce::AudioBuffer<float>& dst,
     return true;
 }
 
+uint64_t AudioChannel::diagMidiOverflows() const noexcept
+{
+    if (!impl->header) return 0;
+    return atomicAt(impl->header->midiOverflows).load(std::memory_order_relaxed);
+}
+
+uint64_t AudioChannel::diagXruns() const noexcept
+{
+    if (!impl->header) return 0;
+    return atomicAt(impl->header->xruns).load(std::memory_order_relaxed);
+}
+
+uint64_t AudioChannel::diagDropouts() const noexcept
+{
+    if (!impl->header) return 0;
+    return atomicAt(impl->header->dropouts).load(std::memory_order_relaxed);
+}
+
 void AudioChannel::signalSandboxWake()
 {
-    // The `if (impl->evtToSandbox)` guard is non-atomic, so a concurrent
-    // close() racing this call could in principle observe a freed handle.
-    // Today's call paths (AudioPauseGuard ctor + dispatchRequest's
-    // kShutdown / disconnect callback) all run on the control thread, and
-    // close() runs on the WinMain thread only after audioThread.join() +
-    // control.stop() — both of which guarantee no in-flight signalSandboxWake
-    // can be racing. If a future caller invokes signalSandboxWake from a
-    // path that doesn't hold those teardown invariants, this guard needs
-    // upgrading (e.g. an atomic<HANDLE> swapped to nullptr by close()
-    // before CloseHandle, with the SetEvent guarded by the swap result).
-    if (impl->evtToSandbox) SetEvent(impl->evtToSandbox);
+    // Wake the sandbox audio worker out of its popInputBlock wait without
+    // publishing a real block — the input-ring doorbell. Used by the
+    // sandbox-side AudioPauseGuard around non-realtime control ops + shutdown.
+    // This must wake OUR OWN worker (same process), so it goes through wakeSelf
+    // (POSIX self-pipe / Win32 evtToSandbox) — NOT signalEvent, whose POSIX
+    // socketpair write would hit the peer instead and spuriously wake it.
+    impl->wakeSelf();
 }
 
 } // namespace slopsmith::sandbox

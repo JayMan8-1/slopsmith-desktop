@@ -27,12 +27,28 @@ namespace slopsmith::sandbox {
 class AudioChannel
 {
 public:
-    // Sentinel names returned/consumed by the OS API.
+    // Handoff from the host side to the sandbox side. On Windows these are
+    // kernel-object names the sandbox re-opens by name. On POSIX the audio
+    // path is fd-passed instead (no named auto-reset event exists on macOS
+    // that is also crash-safe — see AudioChannel_posix.cpp), so the string
+    // names are unused and the integer fds below carry the handoff.
     struct Names
     {
-        juce::String shm;       // file-mapping object name
-        juce::String evtToHost; // sandbox→host (output ready)
-        juce::String evtToSandbox; // host→sandbox (input ready)
+        juce::String shm;       // file-mapping object name (Windows)
+        juce::String evtToHost; // sandbox→host (output ready) (Windows)
+        juce::String evtToSandbox; // host→sandbox (input ready) (Windows)
+
+       #if ! JUCE_WINDOWS
+        // POSIX handoff. `shmFd` is a dup of the anonymous shared-memory fd;
+        // `sandboxAudioFd` is the sandbox's end of the bidirectional doorbell
+        // socketpair. createHostSide fills both with fds the *sandbox* side
+        // consumes: for an in-process loopback the sandbox AudioChannel takes
+        // them directly via openSandboxSide; for a real spawn the host
+        // dup2()s them into the child (SubprocessHandle) and then closes its
+        // copies. openSandboxSide takes ownership and closes them in close().
+        int shmFd = -1;
+        int sandboxAudioFd = -1;
+       #endif
     };
 
     AudioChannel();
@@ -88,6 +104,14 @@ public:
     void signalSandboxWake();
 
     const AudioDimensions& dims() const noexcept { return cachedDims; }
+
+    // Test/diagnostic readers for the shared header's cumulative counters.
+    // Safe to call from either side (both map the same object); return 0 when
+    // the channel isn't mapped. Used by the loopback test in place of
+    // re-opening the shm by name (which POSIX anonymous shm can't do).
+    uint64_t diagMidiOverflows() const noexcept;
+    uint64_t diagXruns() const noexcept;
+    uint64_t diagDropouts() const noexcept;
 
     void close();
 

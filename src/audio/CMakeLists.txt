@@ -22,22 +22,35 @@ set(AUDIO_SOURCES
 # in-process loading (notably Qt5-using plugins from Native Instruments;
 # see docs/VST-SANDBOX-DIAG.md for the diagnosis).
 #
-# Cross-platform note (constitution VIII): only the Windows implementation
-# ships in this PR. macOS / Linux fall back to in-process loading via the
-# stub factory; sandbox PRs for those OSes follow.
+# Cross-platform (constitution VIII): the IPC layer is a platform-neutral core
+# (*_shared.cpp) plus per-OS backends (*_win.cpp / *_posix.cpp). All three
+# desktop platforms now route VST3 plugins through the out-of-process sandbox.
+# The slopsmith-vst-host child that the factory spawns is built by the same
+# cmake-js invocation (src/vst-host) and lands next to slopsmith_audio.node, so
+# resolveSandboxExe() finds it; if it is ever missing the factory returns
+# nullptr and the caller falls back to in-process loading.
+set(SANDBOX_SOURCES
+    Sandbox/SandboxedProcessor.cpp
+    Sandbox/ControlChannel_shared.cpp
+    Sandbox/AudioChannel_shared.cpp
+    Sandbox/SandboxFactory_shared.cpp
+)
 if(WIN32)
-    list(APPEND AUDIO_SOURCES
-        Sandbox/SandboxedProcessor.cpp
-        Sandbox/ControlChannel.cpp
-        Sandbox/AudioChannel.cpp
-        Sandbox/SubprocessHandle.cpp
+    list(APPEND SANDBOX_SOURCES
+        Sandbox/ControlChannel_win.cpp
+        Sandbox/AudioChannel_win.cpp
+        Sandbox/SubprocessHandle_win.cpp
         Sandbox/SandboxFactory_win.cpp
     )
 else()
-    list(APPEND AUDIO_SOURCES
-        Sandbox/SandboxFactory_stub.cpp
+    list(APPEND SANDBOX_SOURCES
+        Sandbox/ControlChannel_posix.cpp
+        Sandbox/AudioChannel_posix.cpp
+        Sandbox/SubprocessHandle_posix.cpp
+        Sandbox/SandboxFactory_posix.cpp
     )
 endif()
+list(APPEND AUDIO_SOURCES ${SANDBOX_SOURCES})
 
 # Build as shared library (.node)
 add_library(slopsmith_audio SHARED ${AUDIO_SOURCES} ${CMAKE_JS_SRC})
