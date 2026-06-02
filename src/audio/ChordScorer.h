@@ -101,6 +101,18 @@ public:
         // Minimum harmonic-to-floor ratio for a note to count as present.
         // Tunable over IPC so the renderer can calibrate without a rebuild.
         float harmonicSnr = 3.0f;
+        // Fundamental-presence gate (harmonicVerify only): a note is rejected
+        // when its f0 peak is weaker than `fundamentalRatio × strongest
+        // partial`. This is the specificity guard against octave-up impostors
+        // (and power-chord-root-only feeding a fifth's comb), which have their
+        // energy at f0's MULTIPLES with f0 itself near the floor.
+        //
+        // The 0.20 default suits guitar, whose DI fundamental is healthy. Bass
+        // DI fundamentals are routinely WEAKER than the 2nd harmonic (amp-sim
+        // DIs, compressed/rolled-off-below-60 Hz tones — see `_ndHpsDetect`),
+        // so the renderer lowers this for bass to stop false rejects. <= 0
+        // disables the gate entirely. Tunable over IPC like harmonicSnr.
+        float fundamentalRatio = 0.20f;
         std::vector<Note> notes;
     };
 

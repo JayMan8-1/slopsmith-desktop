@@ -840,6 +840,9 @@ static Napi::Value GetPitchDetection(const Napi::CallbackInfo& info)
 //                                   //  of band-energy/total (default false)
 //   harmonicSnr?: number,           // min harmonic-to-floor ratio for a hit
 //                                   //  when harmonicVerify is set (default 3.0)
+//   fundamentalRatio?: number,      // fundamental-presence gate: reject when
+//                                   //  f0 peak < ratio*strongest partial; lower
+//                                   //  for bass, <=0 disables (default 0.20)
 // }
 static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
 {
@@ -944,6 +947,14 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
         req.harmonicVerify = reqObj.Get("harmonicVerify").As<Napi::Boolean>().Value();
     if (reqObj.Has("harmonicSnr") && reqObj.Get("harmonicSnr").IsNumber())
         req.harmonicSnr = reqObj.Get("harmonicSnr").As<Napi::Number>().FloatValue();
+    if (reqObj.Has("fundamentalRatio") && reqObj.Get("fundamentalRatio").IsNumber())
+    {
+        // Drop NaN/Inf: a non-finite ratio poisons the fundamental-presence
+        // gate (fundMag >= NaN is always false -> every note false-rejected).
+        // Keep the safe 0.20 default instead.
+        const float v = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+        if (std::isfinite(v)) req.fundamentalRatio = v;
+    }
 
     if (reqObj.Has("offsets") && reqObj.Get("offsets").IsArray())
     {
@@ -1058,6 +1069,8 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
 //   capo?: number,                  // default 0
 //   pitchCheckCents?: number,       // default 0 (energy-only)
 //   harmonicSnr?: number,           // default 3.0
+//   fundamentalRatio?: number,      // fundamental-presence gate, lower for
+//                                   //  bass, <=0 disables (default 0.20)
 //   timingTolerance?: number,       // seconds, default 0.1
 //   notes: [{ id:string, t:number, s:number, f:number, sus:number,
 //             ho?,po?,b?,sl?,hm?:boolean }, ...]
@@ -1098,6 +1111,13 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
         chart.pitchCheckCents = reqObj.Get("pitchCheckCents").As<Napi::Number>().FloatValue();
     if (reqObj.Has("harmonicSnr") && reqObj.Get("harmonicSnr").IsNumber())
         chart.harmonicSnr = reqObj.Get("harmonicSnr").As<Napi::Number>().FloatValue();
+    if (reqObj.Has("fundamentalRatio") && reqObj.Get("fundamentalRatio").IsNumber())
+    {
+        // Drop NaN/Inf (see ScoreChord): a non-finite ratio poisons the
+        // fundamental-presence gate; keep the safe 0.20 default.
+        const float v = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+        if (std::isfinite(v)) chart.fundamentalRatio = v;
+    }
     if (reqObj.Has("timingTolerance") && reqObj.Get("timingTolerance").IsNumber())
         chart.timingTolerance = reqObj.Get("timingTolerance").As<Napi::Number>().DoubleValue();
 

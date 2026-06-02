@@ -68,6 +68,7 @@ public:
         int capo = 0;
         float pitchCheckCents = 0.0f;
         float harmonicSnr = 3.0f;
+        float fundamentalRatio = 0.20f; // ChordScorer fundamental-presence gate
         double timingTolerance = 0.1; // seconds — half-width of the scoring window
         std::vector<ChartNote> notes;
     };
@@ -143,6 +144,11 @@ private:
     // setChart() (N-API thread) sets this; run() clears the stale onset log on
     // the next tick. The log itself stays worker-thread only.
     std::atomic<bool> onsetResetPending { false };
+    // Desired onset profile, set from the chart arrangement by setChart()
+    // (N-API thread); run() applies it to the worker-owned onsetDetector and
+    // tracks what is currently applied in `appliedBassProfile` (worker-only).
+    std::atomic<bool> wantBassProfile { false };
+    bool appliedBassProfile = false;
 
     // Chart + context + per-note state, all guarded by `lock`. The worker
     // thread mutates `state` and `pending`; setChart()/clearChart()/drain()

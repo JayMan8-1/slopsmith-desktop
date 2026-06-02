@@ -84,6 +84,11 @@ export interface ChordScoreRequest {
     pitchCheckCents?: number; // 0 = energy-only chord check
     minHitRatio?: number;
     numSamples?: number;      // override the 4096 default window
+    // Harmonic-comb verification controls (see NodeAddon ScoreChord docs).
+    bypassMl?: boolean;        // force the DSP scorer even with an ML model loaded
+    harmonicVerify?: boolean;  // score by harmonic-comb energy, not band/total
+    harmonicSnr?: number;      // min harmonic-to-floor ratio for a hit (default 3.0)
+    fundamentalRatio?: number; // fundamental-presence gate; lower for bass, <=0 disables (default 0.20)
     notes: ChordScoreNote[];
 }
 export interface ChordScoreNoteResult {
@@ -123,6 +128,7 @@ export interface ChartUpdate {
     capo?: number;
     pitchCheckCents?: number;
     harmonicSnr?: number;
+    fundamentalRatio?: number; // fundamental-presence gate; lower for bass, <=0 disables (default 0.20)
     timingTolerance?: number;  // seconds — half-width of the scoring window
     notes: ChartNote[];
 }

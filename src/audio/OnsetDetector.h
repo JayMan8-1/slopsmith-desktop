@@ -38,6 +38,15 @@ public:
     // fabricate an onset. Does not change the configured sample rate.
     void reset();
 
+    // Switch attack-detection tuning between guitar (default) and bass. A bass
+    // pluck — especially fingerstyle — rises slower and softer than a guitar
+    // pick, so the bass profile lowers the flux-band floor, relaxes the
+    // adaptive-threshold multiplier, and lengthens the onset backdate.
+    // Recomputes the rate-dependent state from the last prepare() sample rate.
+    // No-op if the profile is unchanged. Call from the same thread that drives
+    // process() (the NoteVerifier worker thread) — not concurrently with it.
+    void setProfile(bool bass);
+
     // Feed contiguous samples whose first element sits at monotonic index
     // `firstSampleIndex`. Detected onsets are appended to `out`. A gap in the
     // index sequence (samples lost) resyncs and clears flux history.
@@ -80,4 +89,17 @@ private:
 
     int loBin = 1, hiBin = 64;     // flux band, set from the sample rate
     int onsetBackdateSamples = 2400;  // onset calibration in samples, per rate
+
+    // Profile-dependent tunables. prepare()/setProfile() write these from the
+    // active profile, then derive loBin/hiBin/onsetBackdateSamples for the
+    // current sample rate. Defaults are the guitar values.
+    bool   bassProfile      = false;
+    float  thresholdK       = 1.8f;     // adaptive-threshold multiplier
+    double debounceSeconds  = 0.040;    // min gap between onsets
+    double backdateSeconds  = 0.050;    // flux-peak-vs-attack + chain latency
+    double bandLoHz         = 70.0;     // flux band floor
+    double bandHiHz         = 3000.0;   // flux band ceiling
+
+    // Load the profile tunables then recompute the rate-dependent state.
+    void applyProfile();
 };

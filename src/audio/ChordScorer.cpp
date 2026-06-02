@@ -304,11 +304,17 @@ ChordScorer::Result ChordScorer::scoreChord(const float* buffer, int numSamples,
 
             constexpr int kHarmonics = 5;
             double harmEnergy = 0.0;
-            // Pitch is read from the h=1 fundamental only. Taking the strongest
-            // partial ÷ its number (the previous approach) reads systematically
-            // sharp: real strings are inharmonic, so the 2nd/3rd partials sit
-            // sharp of 2f0/3f0 — and on a DI tone those upper partials are
-            // often the strongest. The fundamental carries no inharmonicity.
+            // Per-partial peak frequency + magnitude, captured so the pitch
+            // estimate below can blend the best-resolved low partials (bass)
+            // instead of being locked to the h=1 fundamental (guitar).
+            double harmFreq[kHarmonics + 1] = { 0.0 };
+            float  harmMag[kHarmonics + 1]  = { 0.0f };
+            // Pitch on guitar is read from the h=1 fundamental only. Taking the
+            // strongest partial ÷ its number reads systematically sharp: real
+            // strings are inharmonic, so the 2nd/3rd partials sit sharp of
+            // 2f0/3f0 — and on a DI tone those upper partials are often the
+            // strongest. At guitar fundamentals (>=82 Hz) the f0 bin is well
+            // resolved, so the fundamental is the bias-free pitch source.
             double fundamentalFreq = f0;
             float  fundMag = 0.0f;     // h=1 peak magnitude
             float  maxHarmMag = 0.0f;  // strongest partial's magnitude
@@ -317,6 +323,8 @@ ChordScorer::Result ChordScorer::scoreChord(const float* buffer, int numSamples,
                 float mag = 0.0f;
                 const double freq = peakNear(f0 * h, mag);
                 harmEnergy += (double) mag * mag;
+                harmFreq[h] = freq;
+                harmMag[h]  = mag;
                 if (h == 1) { fundamentalFreq = freq; fundMag = mag; }
                 if (mag > maxHarmMag) maxHarmMag = mag;
             }
@@ -338,8 +346,32 @@ ChordScorer::Result ChordScorer::scoreChord(const float* buffer, int numSamples,
             const double denom  = std::max(std::max(floorAvg, avgBin), 1e-20);
             const float  snr    = (float) (harmAvg / denom);
 
+            // Pitch source. Guitar: the h=1 fundamental (bias-free, well
+            // resolved at >=82 Hz). Bass: the fundamental of a low note spans
+            // barely one FFT bin (~157 cents/bin at the open low-B) and is
+            // often suppressed on a DI, so its lone cents reading is noise.
+            // Estimate f0 instead from a magnitude-weighted blend of the low
+            // partials' implied f0 (freq_h / h) — 2-3x better resolved, and the
+            // small inharmonic bias on h=2/3 is far below the low-bin error it
+            // replaces. Only partials clearly above the per-note floor
+            // contribute, so a spurious peak in an empty harmonic window cannot
+            // drag the estimate. (An octave-up impostor is still caught by the
+            // fundamental-presence gate below, which runs before this is used.)
+            double pitchFreq = fundamentalFreq;
+            if (req.arrangement == "bass" && maxHarmMag > 0.0f)
+            {
+                double wsum = 0.0, fsum = 0.0;
+                for (int h = 1; h <= 3 && h <= kHarmonics; ++h)
+                {
+                    if (harmMag[h] < 0.25f * maxHarmMag) continue;
+                    const double w = (double) harmMag[h];
+                    wsum += w;
+                    fsum += w * (harmFreq[h] / (double) h);
+                }
+                if (wsum > 0.0) pitchFreq = fsum / wsum;
+            }
             const float centsError =
-                foldOctaveCents((float) (1200.0 * std::log2(fundamentalFreq / f0)));
+                foldOctaveCents((float) (1200.0 * std::log2(pitchFreq / f0)));
 
             // Fundamental-presence gate — specificity against octave / related
             // wrong notes. A genuine note has real energy at f0. An octave-up
@@ -348,12 +380,14 @@ ChordScorer::Result ChordScorer::scoreChord(const float* buffer, int numSamples,
             // f0's MULTIPLES, with f0 itself near the noise floor — so when the
             // fundamental peak is tiny next to the strongest partial, reject.
             // Skipped for harmonic-flagged notes, whose fundamental is meant to
-            // be weak.
-            constexpr float kFundamentalRatio = 0.20f;
+            // be weak. The ratio is req-tunable (ChordScorer.h): guitar keeps
+            // the 0.20 default; bass passes a lower value because its DI
+            // fundamental is legitimately weak, and `<= 0` disables the gate.
             const bool fundamentalPresent =
                 note.harmonic
+             || req.fundamentalRatio <= 0.0f
              || maxHarmMag <= 0.0f
-             || fundMag >= kFundamentalRatio * maxHarmMag;
+             || fundMag >= req.fundamentalRatio * maxHarmMag;
 
             // The `bandEnergy` field carries the SNR here so the renderer's
             // diagnostics still have a number to surface.

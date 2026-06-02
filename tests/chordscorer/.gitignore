@@ -1,0 +1,5 @@
+# CMake build output
+build/
+# Generated click track (regenerable from make_calibration.py) plus local bass
+# recordings / synthetic renders used for benching — all large binaries.
+*.wav
