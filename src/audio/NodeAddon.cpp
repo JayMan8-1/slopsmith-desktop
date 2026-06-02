@@ -1421,6 +1421,29 @@ static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
 {
     sandboxRequired = false;
 
+    // A plugin persisted in a signal-chain preset can be uninstalled or
+    // deleted between runs. Instantiating a VST3 whose module is gone from
+    // disk faults deep inside the format loader (a stack-buffer-overrun /
+    // 0xC0000409 on Windows) and takes the whole app down on startup — before
+    // the crash blocklist or sandbox can ever intervene, because the preset is
+    // restored independently of those guards. A native access violation also
+    // can't be caught by the renderer's JS try/catch around loadPreset. So
+    // pre-flight a cheap existence check here, the single choke point shared by
+    // every load path (direct LoadVST and preset restore, in-process and
+    // sandboxed, all platforms), and fail soft when the file is missing.
+    //
+    // Only filesystem paths are judged: VST3/LV2 fileOrIdentifiers are absolute
+    // paths (File::exists covers both a .vst3 file and a bundle directory),
+    // whereas macOS AudioUnit identifiers ("AudioUnit:...") are not absolute
+    // paths and must not be rejected here.
+    if (juce::File::isAbsolutePath(pluginPath) && ! juce::File(pluginPath).exists())
+    {
+        error = "Plugin file not found: " + pluginPath;
+        VST_TRACE("loadVstSandboxAware: missing plugin file '%s' — skipping load",
+                  pluginPath.toRawUTF8());
+        return nullptr;
+    }
+
     juce::PluginDescription probeDesc;
     probeDesc.fileOrIdentifier = pluginPath;
     probeDesc.name = juce::File(pluginPath).getFileNameWithoutExtension();
