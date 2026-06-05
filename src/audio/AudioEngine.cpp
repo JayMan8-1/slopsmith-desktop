@@ -632,16 +632,31 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
             res.duplex = true;
             return res;
         }
-        duplexMode.store(true, std::memory_order_relaxed);
 
-        if (auto* dev = inputDeviceManager.getCurrentAudioDevice())
+        const bool prevDuplex = duplexMode.load(std::memory_order_relaxed);
+        duplexMode.store(true, std::memory_order_relaxed);
+        if (readyForStartAudio())
         {
-            res.sampleRate = dev->getCurrentSampleRate();
-            res.inputBlockSize = dev->getCurrentBufferSizeSamples();
-            res.outputBlockSize = res.inputBlockSize;
+            if (auto* dev = inputDeviceManager.getCurrentAudioDevice())
+            {
+                res.sampleRate = dev->getCurrentSampleRate();
+                res.inputBlockSize = dev->getCurrentBufferSizeSamples();
+                res.outputBlockSize = res.inputBlockSize;
+            }
+            res.ok = true;
+            res.duplex = true;
         }
-        res.ok = true;
-        res.duplex = true;
+        else
+        {
+            duplexMode.store(prevDuplex, std::memory_order_relaxed);
+            res.duplex = true;
+            res.error = "no current device after setup";
+            fprintf(stderr,
+                    "[AudioEngine] setAudioDevices: duplex setup not ready (device=%p sr=%.0f bs=%d)\n",
+                    (void*) inputDeviceManager.getCurrentAudioDevice(),
+                    currentSampleRate.load(std::memory_order_relaxed),
+                    outputBlockSize.load(std::memory_order_relaxed));
+        }
     }
     else
     {
@@ -659,7 +674,8 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
         duplexMode.store(false, std::memory_order_relaxed);
     }
 
-    if (wasRunning) startAudio();
+    if (wasRunning && readyForStartAudio())
+        startAudio();
     return res;
 }
 
@@ -1087,11 +1103,50 @@ void AudioEngine::teardownSplitMode()
 
 // ── Audio Control ─────────────────────────────────────────────────────────────
 
+bool AudioEngine::readyForStartAudio() const
+{
+    const double sr = currentSampleRate.load(std::memory_order_relaxed);
+    const int bs = outputBlockSize.load(std::memory_order_relaxed);
+    if (sr <= 0.0 || bs <= 0)
+        return false;
+
+    if (duplexMode.load(std::memory_order_relaxed))
+        return inputDeviceManager.getCurrentAudioDevice() != nullptr;
+
+    return inputDeviceManager.getCurrentAudioDevice() != nullptr
+        && outputDeviceManager.getCurrentAudioDevice() != nullptr;
+}
+
 void AudioEngine::startAudio()
 {
     if (audioRunning.load(std::memory_order_relaxed))
     {
         fprintf(stderr, "[AudioEngine] startAudio: already running\n");
+        return;
+    }
+
+    if (!readyForStartAudio())
+    {
+        const char* reason = "not-ready";
+        const double sr = currentSampleRate.load(std::memory_order_relaxed);
+        const int bs = outputBlockSize.load(std::memory_order_relaxed);
+        if (sr <= 0.0)
+            reason = "sr-zero";
+        else if (bs <= 0)
+            reason = "bs-zero";
+        else if (duplexMode.load(std::memory_order_relaxed))
+            reason = "no-device";
+        else if (inputDeviceManager.getCurrentAudioDevice() == nullptr)
+            reason = "no-input-device";
+        else
+            reason = "no-output-device";
+
+        fprintf(stderr,
+                "[AudioEngine] startAudio: REFUSED reason=%s duplex=%d sr=%.0f bs=%d\n",
+                reason,
+                (int) duplexMode.load(std::memory_order_relaxed),
+                sr,
+                bs);
         return;
     }
 
@@ -1142,6 +1197,7 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     stopBackingNoLock();
     backingTransport.reset();
     backingSource.reset();
+    backingPrepared = false;
 
     const bool exists = file.existsAsFile();
     std::cerr << "[AudioEngine] loadBackingTrack path="
@@ -1202,6 +1258,7 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
 
         backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
         backingBuffer.setSize(2, bs, false, false, true);
+        backingPrepared = true;
     }
 
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
@@ -1219,7 +1276,8 @@ void AudioEngine::setBackingPosition(double seconds)
     if (backingTransport)
     {
         backingTransport->setPosition(seconds);
-        backingStretch.reset();
+        if (backingPrepared)
+            backingStretch.reset();
         // Read back the actual position; the transport may clamp (e.g. negative or past EOF).
         const double pos = backingTransport->getCurrentPosition();
         cachedBackingPosition.store(pos);
@@ -1230,23 +1288,56 @@ void AudioEngine::setBackingPosition(double seconds)
 void AudioEngine::startBacking()
 {
     const juce::ScopedLock sl(backingLock);
-    if (backingTransport)
-    {
-        backingTransport->start();
-        backingPlaying.store(true);
-        backingHeardPositionSec.store(backingTransport->getCurrentPosition(),
-                                      std::memory_order_relaxed);
-    }
+    const bool hasTransport = (backingTransport != nullptr);
+    const bool prepared = backingPrepared;
+    const bool running = audioRunning.load(std::memory_order_relaxed);
+    const double sr = currentSampleRate.load(std::memory_order_relaxed);
+    const int bs = outputBlockSize.load(std::memory_order_relaxed);
+
+    const char* reason = nullptr;
+    if (!hasTransport)
+        reason = "no-transport";
+    else if (!prepared)
+        reason = "not-prepared";
+    else if (!running)
+        reason = "not-running";
+    else if (sr <= 0.0)
+        reason = "sr-zero";
+    else if (bs <= 0)
+        reason = "bs-zero";
+
+    if (reason)
+        fprintf(stderr,
+                "[AudioEngine] startBacking: transport=%d prepared=%d running=%d sr=%.0f bs=%d -> REFUSED reason=%s\n",
+                hasTransport ? 1 : 0, prepared ? 1 : 0, running ? 1 : 0, sr, bs, reason);
+    else
+        fprintf(stderr,
+                "[AudioEngine] startBacking: transport=%d prepared=%d running=%d sr=%.0f bs=%d -> START\n",
+                hasTransport ? 1 : 0, prepared ? 1 : 0, running ? 1 : 0, sr, bs);
+
+    if (!backingTransport || !backingPrepared)
+        return;
+    if (!audioRunning.load(std::memory_order_relaxed))
+        return;
+    if (sr <= 0.0 || bs <= 0)
+        return;
+
+    backingTransport->start();
+    backingPlaying.store(true);
+    const double pos = backingTransport->getCurrentPosition();
+    backingHeardPositionSec.store(pos, std::memory_order_relaxed);
+    cachedBackingPosition.store(pos);
 }
 
 void AudioEngine::stopBackingNoLock()
 {
-    if (backingTransport)
-    {
-        backingTransport->stop();
+    backingPlaying.store(false, std::memory_order_relaxed);
+    if (!backingTransport)
+        return;
+
+    backingTransport->stop();
+    if (backingPrepared)
         backingStretch.reset();
-        backingPlaying.store(false);
-    }
 }
 
 void AudioEngine::stopBacking()
@@ -1314,7 +1405,8 @@ int AudioEngine::renderBackingBlockLocked(int numSamples)
         backingSpeed.store(juce::jlimit(0.01, kMaxBackingSpeed,
                                         backingPendingSpeed.load(std::memory_order_relaxed)),
                            std::memory_order_relaxed);
-        backingStretch.reset();
+        if (backingPrepared)
+            backingStretch.reset();
         backingHeardPositionSec.store(backingTransport->getCurrentPosition(),
                                       std::memory_order_relaxed);
     }
@@ -1483,6 +1575,7 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
             backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
             backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
             backingBuffer.setSize(2, bs, false, false, true);
+            backingPrepared = true;
         }
     }
 }
@@ -1496,6 +1589,11 @@ void AudioEngine::audioDeviceStopped()
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
     audioRunning.store(false, std::memory_order_relaxed);
+    backingPlaying.store(false, std::memory_order_relaxed);
+    {
+        const juce::ScopedLock sl(backingLock);
+        backingPrepared = false;
+    }
 
     // Note on split-mode lifecycle: we deliberately do NOT detach the
     // output callback here. JUCE auto-restarts a transiently-stopped input
@@ -1562,6 +1660,7 @@ void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
             backingStretchLatencySamples.store(backingStretch.outputLatency(), std::memory_order_relaxed);
             backingInputBuffer.setSize(2, maxInputFrames, false, false, true);
             backingBuffer.setSize(2, bs, false, false, true);
+            backingPrepared = true;
         }
     }
 }
