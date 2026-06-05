@@ -123,6 +123,7 @@ clone_slopsmith() {
 		byrongamatos/slopsmith-plugin-drum-highway-3d
 		byrongamatos/slopsmith-plugin-drums
 		byrongamatos/slopsmith-plugin-editor
+		byrongamatos/slopsmith-plugin-flappy-bend
 		byrongamatos/slopsmith-plugin-fretboard
 		byrongamatos/slopsmith-plugin-jumpingtab
 		byrongamatos/slopsmith-plugin-lyrics-karaoke
@@ -136,6 +137,7 @@ clone_slopsmith() {
 		byrongamatos/slopsmith-plugin-profileimport
 		byrongamatos/slopsmith-plugin-sectionmap
 		byrongamatos/slopsmith-plugin-setlist
+		byrongamatos/slopsmith-plugin-song-preview
 		byrongamatos/slopsmith-plugin-stepmode
 		byrongamatos/slopsmith-plugin-studio
 		byrongamatos/slopsmith-plugin-tabimport
@@ -143,10 +145,10 @@ clone_slopsmith() {
 		byrongamatos/slopsmith-plugin-tones
 		# Community plugins
 		alleexx/slopsmith-plugin-transpose-chords
-		DeathlySin/slopsmith-plugin-song-preview
+		ChrisBeWithYou/slopsmith-plugin-slopscale
+		Jafz2001/slopsmith-plugin-nam-rig-builder
 		masc0t/slopsmith-plugin-find-more
 		masc0t/slopsmith-plugin-invert-highway
-		masc0t/slopsmith-plugin-the-daily
 		masc0t/slopsmith-plugin-themes
 		masc0t/slopsmith-update-manager:update_manager
 		narvasus/slopsmith-plugin-stem-mixer

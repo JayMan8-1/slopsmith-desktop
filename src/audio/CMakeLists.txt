@@ -1,13 +1,10 @@
 # Slopsmith Audio Engine — Node.js native addon built with JUCE
 # Produces slopsmith_audio.node loadable via require()
 
-set(SOUNDTOUCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/soundtouch")
-
 set(AUDIO_SOURCES
     NodeAddon.cpp
     NoiseGate.cpp
     TonePolish.cpp
-    BackingTimeStretch.cpp
     AudioEngine.cpp
     SignalChain.cpp
     VSTHost.cpp
@@ -235,39 +232,14 @@ else()
     target_compile_definitions(slopsmith_audio PRIVATE SLOPSMITH_ONNX_SUPPORT=0)
 endif()
 
+# Signalsmith Stretch: pitch-preserving time-stretch for the backing track.
+# signalsmith-stretch.h includes "signalsmith-linear/stft.h",
+# so the linear repo's parent must also be in the include path.
+set(SS_STRETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith-stretch")
+set(SS_LINEAR_PARENT "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_include_directories(slopsmith_audio PRIVATE
+    "${SS_STRETCH_DIR}"
+    "${SS_LINEAR_PARENT}")
+
 # Include directory for our headers
 target_include_directories(slopsmith_audio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-
-# SoundTouch — preserve-pitch tempo change for backing tracks (LGPL 2.1).
-if(EXISTS "${SOUNDTOUCH_DIR}/include/SoundTouch.h")
-    set(SOUNDTOUCH_SOURCES
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/AAFilter.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/BPMDetect.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/FIFOSampleBuffer.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/FIRFilter.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/InterpolateCubic.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/InterpolateLinear.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/InterpolateShannon.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/PeakFinder.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/RateTransposer.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/SoundTouch.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/TDStretch.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/cpu_detect_x86.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/mmx_optimized.cpp"
-        "${SOUNDTOUCH_DIR}/source/SoundTouch/sse_optimized.cpp"
-    )
-    add_library(soundtouch_static STATIC ${SOUNDTOUCH_SOURCES})
-    target_include_directories(soundtouch_static PUBLIC "${SOUNDTOUCH_DIR}/include")
-    target_compile_definitions(soundtouch_static PUBLIC SOUNDTOUCH_FLOAT_SAMPLES)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv8|aarch64|ARM64)")
-        target_compile_definitions(soundtouch_static PRIVATE SOUNDTOUCH_USE_NEON)
-    endif()
-    target_compile_options(soundtouch_static PRIVATE
-        $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unknown-pragmas>)
-    target_link_libraries(slopsmith_audio PRIVATE soundtouch_static)
-    target_compile_definitions(slopsmith_audio PRIVATE SLOPSMITH_SOUNDTOUCH=1)
-    message(STATUS "SoundTouch found — backing-track timestretch enabled")
-else()
-    message(WARNING "SoundTouch not found at ${SOUNDTOUCH_DIR} — backing speed uses resampling only")
-    target_compile_definitions(slopsmith_audio PRIVATE SLOPSMITH_SOUNDTOUCH=0)
-endif()

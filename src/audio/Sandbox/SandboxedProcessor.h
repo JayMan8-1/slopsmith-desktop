@@ -172,11 +172,16 @@ std::unique_ptr<juce::AudioProcessor> tryLoadSandboxed(
     double sampleRate, int blockSize,
     juce::String& errorOut);
 
-// Decision predicate: should this plugin be loaded through the sandbox?
-// Currently uses a hard-coded filename heuristic (NI Guitar Rig / Massive /
-// Kontakt / ...). The %APPDATA%/Slopsmith/sandbox-list.json override path
-// is on the PR-body follow-up checklist; see SandboxFactory_win.cpp.
-// Exposed for tests and for the UI to surface "this plugin needs the sandbox"
+// Decide whether a plugin should be loaded via the out-of-process sandbox
+// (slopsmith-vst-host.exe) rather than in-process. Under the current
+// sandbox-by-default policy every VST3 plugin routes through the sandbox;
+// non-VST3 processors (NAM, IR) stay in-process. The pre-seed filename list
+// and the runtime crash blocklist still drive the VST_TRACE diagnostic
+// tagging and remain as forward-looking infrastructure for a future
+// per-plugin opt-out (letting specific plugins back into in-process), but
+// they no longer determine routing on their own.
+//
+// Exposed for tests and for the UI to surface "this plugin is sandboxed"
 // status.
 bool shouldSandbox(const juce::PluginDescription& desc);
 
@@ -187,6 +192,14 @@ bool shouldSandbox(const juce::PluginDescription& desc);
 // offender is made safe after a single crash. Paths are matched
 // case-insensitively. Each call replaces the previous set.
 void setCrashedPlugins(const juce::StringArray& pluginPaths);
+
+// Idempotently append one plugin path to the runtime crash blocklist —
+// distinct from setCrashedPlugins() in that it does not clear the existing
+// set. Designed to be called from the audio-thread SEH catch in
+// SignalChain when a plugin faults during processBlock / prepareToPlay /
+// releaseResources, so future LoadVST calls in this session route the
+// offending plugin to the out-of-process sandbox.
+void addCrashedPlugin(const juce::String& pluginPath);
 
 // Resolve the path to slopsmith-vst-host.exe (sits next to the audio addon
 // .node). Returns a non-existent File if it can't be located. Exposed so the
