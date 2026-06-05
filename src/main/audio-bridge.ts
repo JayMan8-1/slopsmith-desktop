@@ -12,6 +12,7 @@ import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } fro
 type AudioModule = Record<string, (...args: any[]) => any>;
 
 let audio: AudioModule | null = null;
+let _lastIpcBackingSpeed = NaN;
 
 type AudioDeviceSettings = {
     type: string;          // legacy alias = inputType when only type was stored
@@ -187,7 +188,14 @@ function loadNativeAddon(): AudioModule | null {
     return null;
 }
 
+let _audioBridgeInited = false;
+
 export function initAudioBridge(): void {
+    if (_audioBridgeInited) {
+        console.warn('[audio-bridge] initAudioBridge called again — handlers already registered');
+        return;
+    }
+    _audioBridgeInited = true;
     audio = loadNativeAddon();
 
     if (audio) {
@@ -713,6 +721,7 @@ export function initAudioBridge(): void {
     // ── Backing Track ──────────────────────────────────────────────────────
 
     ipcMain.handle('audio:loadBackingTrack', (_event, filePath: string) => {
+        _lastIpcBackingSpeed = NaN;
         return audio?.loadBackingTrack(filePath) ?? false;
     });
 
@@ -734,8 +743,14 @@ export function initAudioBridge(): void {
         // true here but have no effect — return false so the renderer can distinguish
         // a rejected call from a successful one.
         if (!Number.isFinite(speed) || speed <= 0) return false;
+        if (Number.isFinite(_lastIpcBackingSpeed)
+            && Math.abs(speed - _lastIpcBackingSpeed) < 0.001) {
+            return true;
+        }
+        _lastIpcBackingSpeed = speed;
         try {
             audio.setBackingSpeed(speed);
+            console.log(`[audio] setBackingSpeed(${speed}) ok`);
             return true;
         } catch (e: unknown) {
             console.warn(`[audio] setBackingSpeed failed: ${e instanceof Error ? e.message : String(e)}`);

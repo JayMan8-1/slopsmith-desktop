@@ -3,6 +3,20 @@
 // window.slopsmithDesktop for audio engine and desktop features.
 
 const { contextBridge, ipcRenderer } = require('electron');
+
+// Diagnostics: detect duplicate preload evaluation (e.g. popup frames).
+const _preloadGlobal = globalThis as typeof globalThis & {
+    __slopsmithPreloadInit?: boolean;
+    __slopsmithBackingSpeedLast?: number;
+    __slopsmithBackingSpeedSeq?: number;
+};
+if (_preloadGlobal.__slopsmithPreloadInit) {
+    console.warn('[bridge:init] duplicate preload execution', performance.now());
+} else {
+    _preloadGlobal.__slopsmithPreloadInit = true;
+    console.log('[bridge:init]', performance.now());
+}
+
 import type { StartupStatus } from './python';
 import {
     IPC_STARTUP_STATUS,
@@ -301,7 +315,19 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         getBackingPosition: (): Promise<number> => ipcRenderer.invoke('audio:getBackingPosition'),
         getBackingDuration: (): Promise<number> => ipcRenderer.invoke('audio:getBackingDuration'),
         isBackingPlaying: (): Promise<boolean> => ipcRenderer.invoke('audio:isBackingPlaying'),
-        setBackingSpeed: (speed: number): Promise<boolean> => ipcRenderer.invoke('audio:setBackingSpeed', speed),
+        setBackingSpeed: (speed: number): Promise<boolean> => {
+            const seq = (_preloadGlobal.__slopsmithBackingSpeedSeq =
+                (_preloadGlobal.__slopsmithBackingSpeedSeq ?? 0) + 1);
+            console.log('[bridge:setBackingSpeed]', speed, 'seq', seq);
+            console.trace('[bridge:trace]');
+            const prev = _preloadGlobal.__slopsmithBackingSpeedLast ?? NaN;
+            if (Number.isFinite(prev) && Math.abs(speed - prev) < 0.001) {
+                console.log('[bridge:setBackingSpeed] skip duplicate', speed);
+                return Promise.resolve(true);
+            }
+            _preloadGlobal.__slopsmithBackingSpeedLast = speed;
+            return ipcRenderer.invoke('audio:setBackingSpeed', speed);
+        },
 
         // Presets
         savePreset: () => ipcRenderer.invoke('audio:savePreset'),
