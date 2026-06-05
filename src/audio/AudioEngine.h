@@ -298,6 +298,9 @@ private:
     DeviceConfigResult applySplitSetup(const DeviceConfig& config);
     void teardownSplitMode();
 
+    // True when device managers and sr/bs atomics are ready for callback registration.
+    bool readyForStartAudio() const;
+
     // ML-backed chord scoring against the MlNoteDetector's active-pitch set.
     // Used by scoreChord() when a Basic Pitch model is loaded.
     ChordScorer::Result scoreChordWithMl(const ChordScorer::Request& req) const;
@@ -359,6 +362,9 @@ private:
     // mid-slider-drag).
     std::atomic<double> backingPendingSpeed{1.0};
     std::atomic<bool> backingSpeedChangePending{false};
+    // True after prepareToPlay + stretch preset/buffers for the current transport.
+    // Read/write only while holding backingLock.
+    bool backingPrepared{false};
     juce::CriticalSection backingLock;
 
     // Toggled from startAudio()/stopAudio() (main / device-management
