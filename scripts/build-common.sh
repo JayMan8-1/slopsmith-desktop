@@ -147,15 +147,7 @@ clone_slopsmith() {
 		alleexx/slopsmith-plugin-transpose-chords
 		ChrisBeWithYou/slopsmith-plugin-slopscale
 		DeathlySin/slopsmith-plugin-song-preview
-		# slopsmith-org fork of Jafz2001/slopsmith-plugin-nam-rig-builder. The
-		# upstream bundles its VST3s with the bundle folder renamed to a display
-		# name but the inner binary left at its DPF build name, so the VST3 SDK
-		# (which derives the binary name from the folder) can't load them on
-		# Linux or Windows — 82 of 100 effects fail. The fork renames the inner
-		# Contents/x86_64-{linux,win} binaries to match. Revert to the upstream
-		# once the upstream fix (Jafz2001/slopsmith-plugin-nam-rig-builder#30)
-		# merges.
-		slopsmith/slopsmith-plugin-nam-rig-builder
+		Jafz2001/slopsmith-plugin-nam-rig-builder
 		masc0t/slopsmith-plugin-find-more
 		masc0t/slopsmith-plugin-invert-highway
 		masc0t/slopsmith-plugin-themes
