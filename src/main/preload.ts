@@ -155,7 +155,24 @@ export interface NoteDetection {
     sampleRate: number;
 }
 
-contextBridge.exposeInMainWorld('slopsmithDesktop', {
+// Expose the privileged desktop bridge ONLY in the main frame. The window
+// ships with webSecurity:false and this preload runs in every frame, so a
+// remote sub-frame (e.g. the tutorials plugin's YouTube embed) would
+// otherwise inherit the full IPC surface — audio engine, auto-update, etc.
+// `window === window.top` is true only in the top frame; in a (cross-origin)
+// sub-frame `window.top` is a different WindowProxy, so the identity check is
+// false without throwing. main.ts's will-frame-navigate guard allow-lists the
+// embed origins on the strength of this gate. Plugins are hydrated into the
+// main document (not iframes) and window.open pop-outs are their own top-level
+// frames, so neither loses the bridge.
+const isMainFrame = (() => {
+    // preload.ts compiles without the DOM lib, so reach the frame's window via
+    // globalThis (identical to `window` in the renderer at runtime).
+    const w = globalThis as unknown as { top?: unknown };
+    try { return w === w.top; } catch { return false; }
+})();
+
+const slopsmithDesktopApi = {
     // Platform detection
     isDesktop: true,
     platform: process.platform,
@@ -415,6 +432,10 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
     power: {
         setScreenAwake: (keep: boolean) => ipcRenderer.invoke(IPC_POWER_SET_SCREEN_AWAKE, keep),
     },
-});
+};
+
+if (isMainFrame) {
+    contextBridge.exposeInMainWorld('slopsmithDesktop', slopsmithDesktopApi);
+}
 
 export {};

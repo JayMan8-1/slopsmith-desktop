@@ -273,6 +273,72 @@ const rendererWebPreferences: Electron.WebPreferences = {
     webSecurity: false,
 };
 
+// Off-origin sub-frame origins the renderer is allowed to embed. The
+// will-frame-navigate guards below block every other off-origin sub-frame so
+// a remote iframe can't ride the privileged preload, but the tutorials plugin
+// legitimately embeds YouTube. This is safe only because preload.ts now gates
+// its IPC bridge to the main frame — an allow-listed embed frame loads with no
+// slopsmithDesktop surface. Host-suffix match (exact host or `.`-prefixed
+// sub-domain) so `evil-youtube.com` / `youtube.com.evil.com` don't slip past.
+const EMBED_ALLOWED_HOSTS = ['youtube.com', 'youtube-nocookie.com'];
+function isAllowedEmbedUrl(url: string): boolean {
+    let host: string;
+    try {
+        const u = new URL(url);
+        if (u.protocol !== 'https:') return false;
+        host = u.hostname.toLowerCase();
+    } catch {
+        return false;
+    }
+    return EMBED_ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
+// True for a host that resolves to this machine's loopback. Covers the whole
+// 127.0.0.0/8 block, IPv6 loopback (bracketed or bare), IPv4-mapped-IPv6
+// loopback, the unspecified address 0.0.0.0/:: (which routes to loopback on the
+// local host), and localhost (with optional trailing dot). Used by the egress
+// guard so an off-origin sub-frame can't dodge it with an aliased local host.
+function isLoopbackHost(host: string): boolean {
+    const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+    if (h === 'localhost' || h === 'localhost.') return true;
+    if (h === '::1' || h === '::' || h === '0.0.0.0') return true;
+    if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+    // IPv4-mapped IPv6, dotted tail: ::ffff:127.0.0.1
+    const dotted = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    if (dotted) return /^127\./.test(dotted[1]);
+    // IPv4-mapped IPv6, hex tail (the form `new URL().hostname` normalizes to):
+    // ::ffff:7f00:1 etc. Decode the embedded 32-bit IPv4 and test 127.0.0.0/8.
+    const hex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hex) {
+        const v4 = ((parseInt(hex[1], 16) << 16) | parseInt(hex[2], 16)) >>> 0;
+        return (v4 >>> 24) === 0x7f;
+    }
+    return false;
+}
+
+// True when `origin` is a concrete remote origin — a real scheme://host that is
+// not our renderer. Opaque origins (a fresh about:blank/srcdoc frame reports
+// "null") and the renderer origin itself return false, so this flags only a
+// frame that has actually loaded a remote page (e.g. the YouTube embed).
+function isConfirmedRemoteOrigin(origin: string, isRendererOrigin: (u: string) => boolean): boolean {
+    if (!origin || origin === 'null') return false;
+    if (isRendererOrigin(origin)) return false;
+    try { new URL(origin); return true; } catch { return false; }
+}
+
+// True when `url` targets a local service the embed has no business reaching:
+// any loopback host, OR our backend's own port on any host (the backend binds
+// 0.0.0.0 in LAN mode, so it is also reachable on the machine's LAN IP — the
+// port match catches that without us having to enumerate interfaces).
+function isLocalServiceUrl(url: string, backendPort: number): boolean {
+    try {
+        const u = new URL(url);
+        return isLoopbackHost(u.hostname) || u.port === String(backendPort);
+    } catch {
+        return false;
+    }
+}
+
 function createWindow(port: number): void {
     mainWindow = new BrowserWindow({
         width: 1400,
@@ -417,12 +483,44 @@ function createWindow(port: number): void {
     }
     mainWindow.webContents.on('will-navigate', blockOffOriginTopLevel('in-window navigation'));
     mainWindow.webContents.on('will-redirect', blockOffOriginTopLevel('cross-origin redirect'));
+
+    // A sub-frame that has loaded a remote page (the YouTube embed) must not
+    // navigate itself — or submit a form — to a local service. Such a document
+    // request would otherwise reach the backend: will-frame-navigate allows any
+    // renderer-origin target, and the onBeforeRequest egress guard exempts
+    // document loads. The onBeforeRequest guard only sees the per-resource
+    // frame; here we have the frame's pre-navigation origin, which is the only
+    // place we can tell "the YouTube frame is steering itself at 127.0.0.1" from
+    // "a same-origin/fresh frame loads an app page". Returns true when blocked.
+    function blockRemoteFrameToLocalService(details: Electron.Event<{ url: string; isMainFrame: boolean }>): boolean {
+        const frame = (details as { frame?: Electron.WebFrameMain | null }).frame;
+        if (!frame || !isLocalServiceUrl(details.url, port)) return false;
+        // Walk the ancestor chain, not just this frame's origin: a remote embed
+        // can spawn a FRESH child iframe (opaque origin) and steer THAT at the
+        // backend. The child isn't a confirmed-remote origin itself, but its
+        // parent (the embed) is — so any remote frame anywhere above this one
+        // means a remote page is driving the navigation.
+        let remoteAncestor: string | null = null;
+        for (let f: Electron.WebFrameMain | null = frame; f; f = f.parent) {
+            if (isConfirmedRemoteOrigin(f.origin, isRendererOrigin)) { remoteAncestor = f.origin; break; }
+        }
+        if (!remoteAncestor) return false;
+        details.preventDefault();
+        console.warn(`[main] Blocked remote frame ${remoteAncestor} from navigating to local service: ${details.url}`);
+        return true;
+    }
+
     mainWindow.webContents.on('will-frame-navigate', (details) => {
         // Top-level frame is handled by will-navigate above; skip so
         // we don't double-log or route to openExternal twice.
         if (details.isMainFrame) return;
+        if (blockRemoteFrameToLocalService(details)) return;
         const navUrl = details.url;
         if (isRendererOrigin(navUrl)) return;
+        // Allow trusted media embeds (e.g. the tutorials plugin's YouTube
+        // player). Safe because the preload bridge is main-frame-only, so the
+        // embed frame carries no privileged IPC surface.
+        if (isAllowedEmbedUrl(navUrl)) return;
         details.preventDefault();
         // Don't openExternal subframe blocks — popping the system
         // browser every time an embedded video / ad-frame tries to
@@ -476,8 +574,10 @@ function createWindow(port: number): void {
         wc.on('will-redirect', blockOffOriginTopLevel('popup cross-origin redirect'));
         wc.on('will-frame-navigate', (details) => {
             if (details.isMainFrame) return;
+            if (blockRemoteFrameToLocalService(details)) return;
             const navUrl = details.url;
             if (isRendererOrigin(navUrl)) return;
+            if (isAllowedEmbedUrl(navUrl)) return;
             details.preventDefault();
             console.warn(`[main] Blocked popup subframe navigation to non-renderer origin: ${navUrl}`);
         });
@@ -635,6 +735,41 @@ function installRendererPermissions(rendererPort: number): void {
             return mediaType === 'audio';
         }
         return true;
+    });
+
+    // Network egress guard for the off-origin embeds the will-frame-navigate
+    // allow-list now permits (the tutorials YouTube player). The window runs
+    // `webSecurity: false`, so a remote sub-frame could otherwise use plain
+    // fetch / XHR / WebSocket to reach the local backend. CORS still blocks it
+    // from *reading* any response (verified), but a state-changing GET /
+    // simple-POST would still land (blind CSRF), and an Origin-header check
+    // misses `no-cors` requests (Origin: null). So gate on the initiating frame:
+    // only the main frame and same-origin sub-frames may reach a local service.
+    def.webRequest.onBeforeRequest((details, callback) => {
+        if (!isLocalServiceUrl(details.url, rendererPort)) {
+            callback({});
+            return;
+        }
+        // Document navigations (the renderer's own load, sub-frame src loads)
+        // are policed by createWindow()'s navigation guards — never cancel them
+        // here, or we'd block the app's own page load (which has no frame yet).
+        if (details.resourceType === 'mainFrame' || details.resourceType === 'subFrame') {
+            callback({});
+            return;
+        }
+        // Data requests (xhr/fetch/websocket/…). Allow the main frame and any
+        // same-origin sub-frame (origin, not url, so inherited-origin about:blank
+        // / srcdoc frames still count). Deny an off-origin sub-frame (the embed)
+        // and — fail closed — any request whose frame was torn down mid-flight to
+        // shed attribution. Slopsmith uses no service/shared workers, so no
+        // legitimate local-service request is frameless.
+        const frame = details.frame;
+        if (frame && (frame.parent === null || isRendererOrigin(frame.origin))) {
+            callback({});
+            return;
+        }
+        console.warn(`[main] Blocked local-service request from ${frame ? `off-origin subframe ${frame.url}` : 'unattributed frame'} → ${details.url}`);
+        callback({ cancel: true });
     });
 }
 
