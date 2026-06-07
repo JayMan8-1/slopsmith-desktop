@@ -60,6 +60,16 @@ cp -r "$SLOPSMITH_DIR/static/." "$BUNDLE_DIR/static/"
 rm -rf "$BUNDLE_DIR/static/art" "$BUNDLE_DIR/static/sloppak_cache"
 find "$BUNDLE_DIR/static" -maxdepth 1 -name 'audio_*.mp3' -delete
 
+# Builtin diagnostic sloppak — server._seed_builtin_diagnostic_sloppaks() copies
+# this into DLC_DIR/diagnostics-builtin/ on library scan startup.
+DIAG_SLOPPAK="$SLOPSMITH_DIR/docs/diagnostics/slopsmith-diagnostic-basic-guitar.sloppak"
+if [ -f "$DIAG_SLOPPAK" ]; then
+    mkdir -p "$BUNDLE_DIR/docs/diagnostics"
+    cp "$DIAG_SLOPPAK" "$BUNDLE_DIR/docs/diagnostics/"
+else
+    echo "WARNING: diagnostic sloppak not found at $DIAG_SLOPPAK — builtin seeding will skip in packaged builds" >&2
+fi
+
 # Cross-platform "cp -r minus .git" — Git Bash on Windows doesn't ship
 # rsync, so we can't rely on `rsync --exclude=.git`. Plain `cp -r`
 # followed by stripping any nested `.git/` directories works on
