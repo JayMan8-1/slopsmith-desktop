@@ -1,8 +1,13 @@
 name: Ship CI
 
+# PRs into both main and release/** run CI through this wrapper so the check
+# run is named "CI / check" (reusable-workflow caller prefix from the `CI`
+# job), matching the org rulesets' required context. ci.yml itself only
+# triggers via workflow_call — it never runs standalone, which would emit an
+# unprefixed "check" the rulesets can't match.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
   workflow_dispatch:
 
 concurrency:
@@ -13,30 +18,5 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    runs-on: ubuntu-22.04
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Read build configuration
-        id: config
-        shell: bash
-        run: |
-          NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
-          echo "node=$NODE_VERSION" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ steps.config.outputs.node }}
-
-      - name: Install npm dependencies
-        run: npm install
-
-      - name: TypeScript type check
-        run: npm run typecheck
-
-      - name: npm audit
-        run: npm audit --audit-level=high
+  CI:
+    uses: ./.github/workflows/ci.yml

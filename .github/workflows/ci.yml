@@ -1,8 +1,12 @@
 name: CI
 
+# Reusable CI checks (typecheck + npm audit). Invoked by ship-ci.yml's `CI`
+# job for PRs into main and release/** so the check run is named "CI / check",
+# matching the org rulesets' required context. It deliberately has no
+# standalone pull_request trigger: a direct run would publish a bare "check"
+# that the rulesets can't match.
 on:
-  pull_request:
-    branches: ['release/**']
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
