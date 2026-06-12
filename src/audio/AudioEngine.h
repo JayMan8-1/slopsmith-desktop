@@ -1,11 +1,5 @@
 #pragma once
-#include "NoiseGate.h"
-#include "TonePolish.h"
-#include "SignalChain.h"
-#include "PitchDetector.h"
-#include "ChordScorer.h"
-#include "MlNoteDetector.h"
-#include "NoteVerifier.h"
+#include "SourceChain.h"
 #include "signalsmith-stretch.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_formats/juce_audio_formats.h>
@@ -14,6 +8,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 class AudioEngine : private juce::AudioIODeviceCallback
@@ -25,27 +21,31 @@ public:
     juce::AudioDeviceManager& getDeviceManager() { return inputDeviceManager; }
     juce::AudioDeviceManager& getInputDeviceManager() { return inputDeviceManager; }
     juce::AudioDeviceManager& getOutputDeviceManager() { return outputDeviceManager; }
-    SignalChain& getSignalChain() { return signalChain; }
-    PitchDetector& getPitchDetector() { return pitchDetector; }
-    MlNoteDetector& getMlNoteDetector() { return mlNoteDetector; }
+    // Per-input DSP now lives on a SourceChain; the engine owns sources[0] (the
+    // legacy default input) and forwards the single-source API to it. Multi-source
+    // fan-out (sources[1..N]) lands in a later phase; the public surface here is
+    // unchanged so NodeAddon and the renderer need no change.
+    SignalChain& getSignalChain() { return source0().getSignalChain(); }
+    PitchDetector& getPitchDetector() { return source0().getPitchDetector(); }
+    MlNoteDetector& getMlNoteDetector() { return source0().getMlNoteDetector(); }
 
     // Load the Basic Pitch ONNX model for the polyphonic ML detector. When a
     // model is loaded, getActiveDetection() / scoreChord() route through it;
     // otherwise they fall back to the YIN PitchDetector / ChordScorer.
-    bool loadNoteModel(const juce::File& modelFile) { return mlNoteDetector.loadModel(modelFile); }
-    bool hasMlNoteDetector() const { return mlNoteDetector.isAvailable(); }
+    bool loadNoteModel(const juce::File& modelFile) { return source0().loadNoteModel(modelFile); }
+    bool hasMlNoteDetector() const { return source0().hasMlNoteDetector(); }
 
     // Best current single-note detection: the ML detector's dominant pitch
     // when a model is loaded, else the YIN detector's latest result. Shape is
     // identical either way so the getPitchDetection bridge is detector-agnostic.
-    PitchDetector::Detection getActiveDetection() const;
+    PitchDetector::Detection getActiveDetection() const { return source0().getActiveDetection(); }
 
     // Raw monophonic YIN detection, always — bypasses the ML preference so the
     // continuous frequency (sub-Hz, parabolically interpolated) and real cents
     // survive even when a Basic Pitch model is loaded. Backs the tuner's
     // getRawPitch bridge endpoint; the YIN detector reads the post-noise-gate
     // signal, so this is silent (frequency -1) when the gate is closed.
-    PitchDetector::Detection getRawPitchDetection() const;
+    PitchDetector::Detection getRawPitchDetection() const { return source0().getRawPitchDetection(); }
 
     // Device enumeration
     struct DeviceTypeInfo
@@ -101,6 +101,15 @@ public:
     };
 
     juce::Array<DeviceTypeInfo> getDeviceTypes();
+
+    // Phase 2: input devices the user can bind as an ADDITIONAL engine input —
+    // restricted to the PRIMARY input's device type (so a JACK pick can't collide
+    // with an ALSA primary), minus the device already open as the primary (that's
+    // "Main") and minus monitor/loopback pseudo-inputs. Keeps the per-panel device
+    // picker to a compatible, sensible set instead of every capture node.
+    struct BindableInput { juce::String typeName; juce::String name; };
+    std::vector<BindableInput> getBindableInputDevices();
+
     juce::Array<double> getSampleRates();
     juce::Array<int> getBufferSizes();
     DeviceOptions probeDeviceOptions(const juce::String& typeName,
@@ -134,50 +143,54 @@ public:
     void stopAudio();
     bool isAudioRunning() const { return audioRunning.load(std::memory_order_relaxed); }
 
-    // Gain controls
-    void setInputGain(float gain) { inputGain.store(gain); }
+    // Gain controls. Input + chain-output gain are per-source (sources[0]);
+    // output gain is the post-mix master and stays engine-global.
+    void setInputGain(float gain) { source0().setInputGain(gain); }
     void setOutputGain(float gain) { outputGain.store(gain); }
-    float getInputGain() const { return inputGain.load(); }
+    float getInputGain() const { return source0().getInputGain(); }
     float getOutputGain() const { return outputGain.load(); }
 
     // Chain output gain — the amp/tone's output level, applied to the guitar
     // signal before the backing track is mixed. Distinct from outputGain (the
     // post-mix master) so a tone-preset switch doesn't move the song volume.
-    void setChainOutputGain(float gain) { chainOutputGain.store(gain); }
-    float getChainOutputGain() const { return chainOutputGain.load(); }
+    void setChainOutputGain(float gain) { source0().setChainOutputGain(gain); }
+    float getChainOutputGain() const { return source0().getChainOutputGain(); }
 
     // Input channel selection (for multi-channel interfaces like Valeton GP-5)
     // 0=left (dry), 1=right (wet), -1=both (mono mix)
-    void setInputChannel(int channel) { selectedInputChannel.store(channel); }
-    int getInputChannel() const { return selectedInputChannel.load(); }
+    void setInputChannel(int channel) { source0().setInputChannel(channel); }
+    int getInputChannel() const { return source0().getInputChannel(); }
 
     // Monitor mute — when true, input is still processed (pitch detection, metering)
     // but output is silenced unless there are processors in the signal chain
-    void setMonitorMute(bool mute) { monitorMuted.store(mute); }
-    bool isMonitorMuted() const { return monitorMuted.load(); }
+    void setMonitorMute(bool mute) { source0().setMonitorMute(mute); }
+    bool isMonitorMuted() const { return source0().isMonitorMuted(); }
 
     // Monitor-mute suppression — when true, the monitor mute is temporarily
     // overridden so the dry guitar stays audible even with an empty chain.
     // The renderer sets this around a song-load chain rebuild (clear + reload),
     // so the brief empty-chain window doesn't silence the player's guitar.
-    void setMonitorMuteSuppressed(bool suppressed) { monitorMuteSuppressed.store(suppressed); }
-    bool isMonitorMuteSuppressed() const { return monitorMuteSuppressed.load(); }
+    void setMonitorMuteSuppressed(bool suppressed) { source0().setMonitorMuteSuppressed(suppressed); }
+    bool isMonitorMuteSuppressed() const { return source0().isMonitorMuteSuppressed(); }
 
     // Number of audio blocks whose signal-chain output had to be scrubbed for
     // non-finite/runaway samples (issue #403). A nonzero value means the chain
     // (NAM/IR/VST) emitted garbage that was contained before it reached the
     // output. Exposed for diagnostics.
-    uint32_t getNonFiniteChainBlocks() const { return nonFiniteChainBlocks.load(std::memory_order_relaxed); }
+    uint32_t getNonFiniteChainBlocks() const { return source0().getNonFiniteChainBlocks(); }
 
     // Noise gate (post-input-gain, pre FX chain; pitch detector sees ungated signal)
-    void setNoiseGate(bool enabled, float thresholdDb, float releaseMs, float depthDb);
+    void setNoiseGate(bool enabled, float thresholdDb, float releaseMs, float depthDb)
+    {
+        source0().setNoiseGate(enabled, thresholdDb, releaseMs, depthDb);
+    }
 
     // Tone Polish — fixed 3-band mastering EQ (HPF 80 Hz, low shelf -3 dB
     // @ 180 Hz, peak -0.5 dB @ 200 Hz Q=1). Applied on the guitar bus only,
     // between chainOutputGain and the backing-track mix, so the backing
     // track and master output gain stay bit-untouched. Defaults on;
     // renderer exposes a per-preset toggle.
-    void setTonePolishEnabled(bool enabled);
+    void setTonePolishEnabled(bool enabled) { source0().setTonePolishEnabled(enabled); }
 
     // Backing track
     void setBackingVolume(float vol) { backingVolume.store(vol); }
@@ -191,65 +204,40 @@ public:
     double getBackingPosition() const { return cachedBackingPosition.load(); }
     double getBackingDuration() const { return cachedBackingDuration.load(); }
 
-    // Metering (read from any thread — atomic)
-    float getInputLevel() const { return currentInputLevel.load(); }
+    // Metering (read from any thread — atomic). Input level/peak are per-source
+    // (sources[0]); output level/peak are the post-mix master, engine-global.
+    float getInputLevel() const { return source0().getInputLevel(); }
     float getOutputLevel() const { return currentOutputLevel.load(); }
-    float getInputPeak() const { return inputPeak.load(); }
+    float getInputPeak() const { return source0().getInputPeak(); }
     float getOutputPeak() const { return outputPeak.load(); }
+    // Running RMS of the backing-track mix bus after the volume fader, updated
+    // each audio block by the audio thread. Safe to call from any thread.
+    float getBackingLevel() const { return currentBackingLevel.load(); }
     void resetPeaks();
 
     // Latency
     double getLatencyMs() const;
 
-    // Raw input frame snapshot for renderer-side polyphonic chord scoring
-    // in notedetect. The audio callback appends the post-input-gain mono
-    // signal (same one fed to the pitch detector) into a lock-free ring;
-    // callers on the main thread can copy out the most-recent N samples.
-    // Capacity is a power of two so audio-thread wrap is a single mask.
-    static constexpr int kInputFrameRingCapacity = 8192;
-    // Capacity must stay a power of two — the audio-thread store relies
-    // on `(write_index + i) & (capacity - 1)` for wraparound, which is
-    // only equivalent to modulo for powers of two. A static_assert keeps
-    // a future "let's bump the buffer to 10000" patch from silently
-    // turning the index into a wrong-direction offset.
-    static_assert((kInputFrameRingCapacity & (kInputFrameRingCapacity - 1)) == 0,
-                  "kInputFrameRingCapacity must be a power of two");
-    // Default snapshot size matches notedetect's _ND_MIN_YIN_SAMPLES (4096
-    // samples — enough for low-E autocorrelation at 48 kHz). Caller can
-    // request fewer; anything larger than the ring capacity gets clamped.
-    std::vector<float> getInputFrame(int numSamples = 4096) const;
+    // Raw input frame snapshot for renderer-side polyphonic chord scoring in
+    // notedetect. Backed by sources[0]'s pre-gate input ring; the rings (and the
+    // power-of-two capacity constants) now live on SourceChain. Default snapshot
+    // size matches notedetect's _ND_MIN_YIN_SAMPLES (4096 samples).
+    std::vector<float> getInputFrame(int numSamples = 4096) const { return source0().getInputFrame(numSamples); }
 
-    // Gapless input-ring consumption for the onset detector. Copies every
-    // sample written since monotonic index `fromIndex` into `out`, and
-    // returns the current write index. The samples in `out` span monotonic
-    // indices [returnedWriteIndex - out.size(), returnedWriteIndex); when no
-    // samples were lost that lower bound equals `fromIndex`. If the gap
-    // exceeds the ring capacity the oldest samples are gone and `out` starts
-    // later than `fromIndex` (out.size() < writeIndex - fromIndex) — the
-    // caller detects the loss by that shortfall. Unlike getInputFrame (which
-    // returns overlapping most-recent-N snapshots), consecutive calls here
-    // consume each sample exactly once.
-    uint64_t getInputSince(uint64_t fromIndex, std::vector<float>& out) const;
+    // Gapless input-ring consumption for the onset detector — consecutive calls
+    // consume each sample exactly once. See SourceChain::getInputSince for the
+    // full gap/shortfall contract.
+    uint64_t getInputSince(uint64_t fromIndex, std::vector<float>& out) const { return source0().getInputSince(fromIndex, out); }
 
-    // Post-noise-gate raw mono audio snapshot for the external tuner plugin.
-    // Distinct from getInputFrame() above: that ring is fed pre-gate because
-    // note-detection scoring wants the dry signal, whereas a tuner wants the
-    // gated signal so room noise below the gate threshold reads as silence
-    // instead of a jittery pitch. The audio callback appends the same post-gate
-    // mono samples the YIN detector sees into a separate lock-free ring; the
-    // tuner copies out the most-recent N samples and runs its own
-    // tuning-optimised pitch pipeline. The ring (see kRawAudioRingCapacity) is
-    // sized so a multi-period window for the lowest supported instrument note
-    // (drop-A 6-string bass, ~27.5 Hz) fits even at 96 kHz. Caller can request
-    // fewer than the default; anything larger than the ring is clamped.
-    std::vector<float> getRawAudioFrame(int numSamples = 4096) const;
+    // Post-noise-gate raw mono audio snapshot for the external tuner plugin
+    // (distinct from getInputFrame's pre-gate ring). Backed by sources[0].
+    std::vector<float> getRawAudioFrame(int numSamples = 4096) const { return source0().getRawAudioFrame(numSamples); }
 
-    // Score a chord against the latest input-ring samples. The chord
-    // context (notes, arrangement, thresholds) comes from the renderer
-    // over IPC; audio data stays inside the engine so no buffers cross
-    // the N-API boundary. Returns the same `{score, hitStrings,
-    // totalStrings, isHit, results[]}` shape as the JS implementation.
-    ChordScorer::Result scoreChord(const ChordScorer::Request& req);
+    // Score a chord against the latest input-ring samples. The chord context
+    // (notes, arrangement, thresholds) comes from the renderer over IPC; audio
+    // data stays inside the engine. Same `{score, hitStrings, totalStrings,
+    // isHit, results[]}` shape as the JS implementation.
+    ChordScorer::Result scoreChord(const ChordScorer::Request& req) { return source0().scoreChord(req); }
 
     // Continuous engine-side chart verification (notedetect). The renderer
     // pushes the song's note chart once via setChart(); a background
@@ -257,16 +245,56 @@ public:
     // playhead and input ring, and the renderer drains finalized verdicts
     // via getNoteVerdicts(). This replaces the renderer's per-tick
     // scoreChord IPC loop, which starved during dense passages.
-    void setChart(const NoteVerifier::ChartUpdate& chart) { noteVerifier.setChart(chart); }
-    void clearChart() { noteVerifier.clearChart(); }
-    std::vector<NoteVerifier::Verdict> getNoteVerdicts() { return noteVerifier.drainVerdicts(); }
+    void setChart(const NoteVerifier::ChartUpdate& chart) { source0().setChart(chart); }
+    void clearChart() { source0().clearChart(); }
+    std::vector<NoteVerifier::Verdict> getNoteVerdicts() { return source0().getNoteVerdicts(); }
 
     // Renderer's unified, already-corrected playhead — the verifier scores
     // against this rather than getBackingPosition(), which is frozen for
     // HTML5-routed (sloppak) songs. Pushed each detect tick via getNoteVerdicts.
-    void setPlayhead(double songTime, bool playing) { noteVerifier.setPlayhead(songTime, playing); }
+    void setPlayhead(double songTime, bool playing) { source0().setPlayhead(songTime, playing); }
+
+    // ── Multi-input source management ─────────────────────────────────────────
+    // A "source" is one independent input chain (its own arrangement chart, note
+    // detection, scoring, tone, and monitor). sources[0] always exists. Adding a
+    // source binds it to an input channel of the current device (multi-channel
+    // interface); separate-device binding lands in a later phase.
+    struct SourceInfo
+    {
+        int id = -1;
+        int inputChannel = -1;   // -1 = mono mix of first pair
+        int deviceKey = 0;       // 0 = primary input device
+        bool active = false;
+    };
+
+    // Activate a pooled chain bound to `inputChannel` of input device `deviceKey`
+    // (0 = primary device) and return its id, or -1 if the pool is full. Prepares
+    // the chain immediately when audio is running so it starts scoring without a
+    // device restart. Control-thread only.
+    int addSource(int inputChannel, int deviceKey = 0);
+    // Deactivate + release a source (id != 0; sources[0] is permanent). Stops its
+    // verifier/ML threads; the pooled object is reused by a later addSource.
+    bool removeSource(int id);
+    // Snapshot of every active source. Control-thread only.
+    std::vector<SourceInfo> listSources() const;
+
+    // Phase 2 (multi-device): open `deviceName` as an ADDITIONAL physical input
+    // device bound to `deviceKey` (1..kMaxExtraInputDevices) so sources created
+    // with addSource(channel, deviceKey) capture from it at its OWN clock. Forces
+    // split mode. Returns "" on success or an error string. unbind stops+releases
+    // it. activeExtraInputCount = # bound+running extras. Control-thread only.
+    juce::String bindInputDevice(int deviceKey, const juce::String& deviceName);
+    bool unbindInputDevice(int deviceKey);
+    int activeExtraInputCount() const;
+
+    // Per-source accessors for the NodeAddon source-indexed API. Return nullptr
+    // for an out-of-range or inactive id (sources[0] always valid).
+    SourceChain* getSource(int id);
 
 private:
+    // sources[0] is the legacy default input chain; always present + active.
+    SourceChain& source0() { return *sources[0]; }
+    const SourceChain& source0() const { return *sources[0]; }
     // Input-device callback. In duplex it writes outputData directly; in split
     // it pushes processed stereo into outputPendingRing for OutputCallback.
     void audioDeviceIOCallbackWithContext(const float* const* inputData,
@@ -324,44 +352,67 @@ private:
     DeviceConfigResult applySplitSetup(const DeviceConfig& config);
     void teardownSplitMode();
 
-    // ML-backed chord scoring against the MlNoteDetector's active-pitch set.
-    // Used by scoreChord() when a Basic Pitch model is loaded.
-    ChordScorer::Result scoreChordWithMl(const ChordScorer::Request& req) const;
-
     // Duplex mode: inputDeviceManager owns both directions, outputDeviceManager idle.
     // Split mode: input-only on inputDeviceManager, output-only on outputDeviceManager
     // with an SPSC ring between them.
     juce::AudioDeviceManager inputDeviceManager;
     juce::AudioDeviceManager outputDeviceManager;
     std::atomic<bool> duplexMode{true};
-    SignalChain signalChain;
-    PitchDetector pitchDetector;
-    MlNoteDetector mlNoteDetector;
-    NoiseGate noiseGate;
-    TonePolish tonePolish;
-    ChordScorer chordScorer;
-    // Background chart-verification thread. Constructed with `*this` so it can
-    // read the engine's input ring (getInputFrame) and playhead
-    // (getBackingPosition); valid because the reference is bound during
-    // AudioEngine construction and the thread is only started in prepare().
-    NoteVerifier noteVerifier{ *this };
+
+    // Per-input capture+detect+monitor chains. A FIXED pool, all constructed up
+    // front, so adding/removing a source never reassigns a pointer the audio
+    // thread is reading — addSource/removeSource only flip an atomic `active`
+    // flag (and prepare/release the chain). sources[0] is the legacy default,
+    // active from construction and bound to the primary input device. The audio
+    // callback fans device channels out to each active source and fans their
+    // monitor signals into the output mix. SourceChain reads the engine's
+    // audioRunning / currentSampleRate atomics through references bound at
+    // construction.
+    static constexpr int kMaxSources = 8;
+    // Max ADDITIONAL input devices (beyond the primary). Declared here — ahead of the
+    // members that size arrays by it (e.g. callbacksInFlight) — though the extra-input
+    // slot registry that uses it lives further below.
+    static constexpr int kMaxExtraInputDevices = 3;
+    std::array<std::unique_ptr<SourceChain>, kMaxSources> sources;
+    // Serialises addSource/removeSource (control threads only — never the audio
+    // thread, which just reads each slot's atomic `active`).
+    std::mutex sourcesMutex;
+    // Audio-thread scratch for the multi-source mix: each active source renders
+    // its 2-channel monitor here in turn, then it is summed into the output.
+    // Pre-sized in audioDeviceAboutToStart so the hot loop never allocates.
+    juce::AudioBuffer<float> sourceMonitorScratch;
+    // Count of device callback bodies currently executing, PER deviceKey (index 0 =
+    // primary input, 1..kMaxExtraInputDevices = each extra-input slot). Each device
+    // callback increments its own key on entry and decrements at its real exit.
+    // removeSource() flips a source inactive (future callbacks snapshot active once
+    // and skip it), then waits to observe THIS SOURCE's deviceKey count == 0 — at
+    // that instant no callback that could touch this source is inside processBlock,
+    // so it is safe to release. Keying per-deviceKey (not a single global counter) is
+    // essential: with the primary + extra inputs on independent clocks they are
+    // rarely ALL idle at once, so a global check would strand removals during steady
+    // multi-device playback. A wedged callback past the bounded wait DEFERS the
+    // release via pendingRelease[], reclaimed later when that key's body is quiescent.
+    std::array<std::atomic<int>, kMaxExtraInputDevices + 1> callbacksInFlight{};
+    // Sources whose release was deferred (handshake timed out). Reclaimed under
+    // sourcesMutex by reclaimPendingReleases() at the next add/removeSource and on
+    // device stop, once it is safe (audio stopped or no callback in flight).
+    std::array<bool, kMaxSources> pendingRelease{};
+    // Release any deferred sources that are now safe to reclaim. Caller holds
+    // sourcesMutex (or is the device-stop path, where the callback is gone).
+    void reclaimPendingReleases();
+
     juce::AudioFormatManager formatManager;
 
-    std::atomic<float> inputGain{1.0f};
+    // Master output (post-mix) — engine-global, not per-source.
     std::atomic<float> outputGain{1.0f};
-    std::atomic<float> chainOutputGain{1.0f};
     std::atomic<float> backingVolume{0.7f};
-    std::atomic<float> currentInputLevel{0.0f};
     std::atomic<float> currentOutputLevel{0.0f};
-    std::atomic<float> inputPeak{0.0f};
+    // Per-block RMS of the backing-track mix bus, written by the audio thread
+    // and read on the main/JS thread via getBackingLevel(). Computed after the
+    // backing volume fader but before the output-gain master so VU meters reflect
+    // the track level independently of the post-mix master volume.
+    std::atomic<float> currentBackingLevel{0.0f};
     std::atomic<float> outputPeak{0.0f};
-    std::atomic<int> selectedInputChannel{-1}; // -1 = mono mix
-    std::atomic<bool> monitorMuted{true}; // mute pass-through by default
-    std::atomic<bool> monitorMuteSuppressed{false}; // overrides monitorMuted during chain rebuilds
-    // Count of audio blocks where the signal chain emitted non-finite/runaway
-    // samples that had to be scrubbed (issue #403). Incremented on the RT
-    // thread (relaxed); read elsewhere for diagnostics/metrics.
-    std::atomic<uint32_t> nonFiniteChainBlocks{0};
 
     // Backing track
     std::unique_ptr<juce::AudioFormatReaderSource> backingSource;
@@ -409,59 +460,10 @@ private:
     std::atomic<int> inputBlockSize{256};
     std::atomic<int> outputBlockSize{256};
 
-    // Lock-free SPSC ring buffer for raw mono input. Single producer is
-    // the audio thread (audioDeviceIOCallbackWithContext); single consumer
-    // is the main thread via getInputFrame(). Capacity is a power of two
-    // so the audio-thread store can mask instead of modulo. The write
-    // index is monotonically increasing in samples while audio is
-    // running, and is reset to 0 on audioDeviceAboutToStart() and
-    // audioDeviceStopped() so a stop→start cycle delivers a clean
-    // cold-start frame instead of mixing in stale samples from the
-    // previous run. Within a single run uint64 covers >12 million years
-    // at 48 kHz before wrap, so the wraparound case is unreachable in
-    // practice between lifecycle resets.
-    //
-    // Each slot is std::atomic<float> with relaxed loads/stores: plain
-    // float concurrent access would be a data race (undefined behavior)
-    // when the writer laps mid-snapshot, even though we're prepared to
-    // tolerate stale data mathematically. Relaxed-ordered access on a
-    // 4-byte type compiles to a plain MOV on x86 and a non-fenced load/
-    // store on AArch64, so the audio-thread cost is the same as the
-    // unsynchronised version while the C++ memory model now permits the
-    // race. Reader still tolerates seeing a few of the oldest samples
-    // from a newer write (worst case ~6% of a 4096-sample snapshot at
-    // 256-sample blocks); the YIN/HPS chord-scoring math is well below
-    // that sensitivity.
-    std::array<std::atomic<float>, kInputFrameRingCapacity> inputFrameRing{};
-    std::atomic<uint64_t> inputFrameRingWriteIndex{0};
-
-    // Lock-free SPSC ring for the POST-gate raw mono signal, backing
-    // getRawAudioFrame() for the tuner plugin. Same single-producer (audio
-    // thread) / single-consumer (main thread) and relaxed-store discipline as
-    // inputFrameRing above, and reset on the same start/stop hooks. Kept
-    // separate because inputFrameRing is pre-gate. Capacity is larger so a
-    // multi-period YIN window for a ~27.5 Hz low note (drop-A 6-string bass)
-    // fits: at 96 kHz one period ≈ 3491 samples, so 16384 holds ~4.7 periods;
-    // at 48 kHz it holds ~9 periods of that note with room to spare.
-    static constexpr int kRawAudioRingCapacity = 16384;
-    static_assert((kRawAudioRingCapacity & (kRawAudioRingCapacity - 1)) == 0,
-                  "kRawAudioRingCapacity must be a power of two");
-    std::array<std::atomic<float>, kRawAudioRingCapacity> rawAudioRing{};
-    std::atomic<uint64_t> rawAudioRingWriteIndex{0};
-
-    // Append post-gate mono samples to rawAudioRing. Audio-thread only,
-    // RT-safe (no allocation/locking); mirrors the inline inputFrameRing write.
-    void pushRawAudioFrame(const float* data, int numSamples) noexcept;
-
-    // Audio-thread scratch buffer used only on zero-output device
-    // configurations (input-only ASIO, certain JACK setups). In the
-    // common case where numOutputChannels > 0, the post-copy buffer's
-    // channel 0 already holds the right mono signal and we read it
-    // directly. With zero outputs the buffer is empty, so we need
-    // somewhere to materialize the post-gain mono source for the
-    // pitch detector and ring. Pre-sized in audioDeviceAboutToStart()
-    // so the hot loop never allocates.
-    std::vector<float> inputCaptureScratch;
+    // The per-input lock-free SPSC rings (pre-gate getInputFrame ring + post-gate
+    // getRawAudioFrame ring), the YIN/ML detectors, and the zero-output capture
+    // scratch now live on SourceChain — one set per input source. See
+    // SourceChain.h for the full lock-free / power-of-two / cold-start rationale.
 
     // Split-mode SPSC ring (unused in duplex). Each slot packs one stereo frame
     // (L+R floats) into a single 64-bit atomic so the consumer reads both
@@ -507,6 +509,90 @@ private:
     std::vector<float> outputPullScratchR;
     juce::AudioBuffer<float> outputBackingBuffer;
     bool outputCallbackRegistered = false;
+
+    // ── Phase 2: additional input devices ────────────────────────────────────
+    // Each ADDITIONAL physical input device (a 2nd/3rd USB interface, e.g. two
+    // separate cables) gets its own AudioDeviceManager + callback running on its
+    // OWN hardware clock, packing its sources' mixed monitor into its own SPSC
+    // ring. audioOutputCallback drains+sums every active ring (drop-oldest wrap
+    // absorbs each device's drift independently — no cross-device resampling, the
+    // failure mode that corrupts a software combine). deviceKey 0 = the primary
+    // inputDeviceManager above; deviceKeys 1..kMaxExtraInputDevices map to
+    // extraInputs[deviceKey-1]. When any extra device is active the engine runs
+    // split (the primary also uses its ring) so the output sum is uniform.
+    // (kMaxExtraInputDevices is declared up top, near kMaxSources.)
+
+    // Forwards a JUCE device callback to the engine, tagged with the slot index.
+    struct InputSlotCallback : juce::AudioIODeviceCallback
+    {
+        AudioEngine* engine = nullptr;
+        int slot = -1;  // index into extraInputs (deviceKey - 1)
+        void audioDeviceIOCallbackWithContext(const float* const* inputData, int numInputChannels,
+                                              float* const* outputData, int numOutputChannels,
+                                              int numSamples,
+                                              const juce::AudioIODeviceCallbackContext&) override
+        {
+            juce::ignoreUnused(outputData, numOutputChannels);
+            if (engine) engine->extraInputCallback(slot, inputData, numInputChannels, numSamples);
+        }
+        void audioDeviceAboutToStart(juce::AudioIODevice* d) override { if (engine) engine->extraInputAboutToStart(slot, d); }
+        void audioDeviceStopped() override { if (engine) engine->extraInputStopped(slot); }
+    };
+
+    struct InputDeviceSlot
+    {
+        juce::AudioDeviceManager manager;
+        InputSlotCallback callback;
+        std::array<std::atomic<uint64_t>, kOutputRingFrames> ring{};
+        std::atomic<uint64_t> writeIndex{0};
+        std::atomic<uint64_t> readIndex{0};
+        std::atomic<uint64_t> overflowCount{0};
+        std::atomic<bool> active{false};      // a device is bound + running
+        std::atomic<double> sampleRate{48000.0};
+        std::atomic<int> blockSize{256};
+        // (extra input latency − primary input latency) in seconds — applied to
+        // this device's sources' verifiers so their capture aligns with the
+        // primary-corrected playhead. Computed when the device starts.
+        std::atomic<double> latencyDeltaSec{0.0};
+        // Audio-thread scratch — one set per slot since each slot's callback runs
+        // on its own thread (can't share the primary's sourceMonitorScratch).
+        juce::AudioBuffer<float> fanScratch;       // the 2ch mix target
+        juce::AudioBuffer<float> monitorScratch;   // per-source render in the N>1 path
+        int deviceKey = 0;                         // deviceKey this slot serves (slot+1)
+        // The device the user WANTS bound here — persistent INTENT, distinct from
+        // the transient `active` (currently open). Set by bindInputDevice, cleared
+        // only by a user unbind. stopAudio()/reconfigure close the device but keep
+        // this so startAudio() re-opens it; this is what survives a device change.
+        // Mutated + read on the control thread only.
+        juce::String desiredDeviceName;
+        // Whether the NEXT extraInputStopped() for this slot is a PERMANENT unbind
+        // (deactivate its sources) vs a transient close (keep them to resume). An
+        // atomic the control thread sets and the device thread reads, so the
+        // permanent-vs-transient decision never races on the juce::String above.
+        std::atomic<bool> permanentUnbind { false };
+    };
+    std::array<InputDeviceSlot, kMaxExtraInputDevices> extraInputs;
+
+    // Per-slot callback hooks (audio + device-management threads).
+    void extraInputCallback(int slot, const float* const* inputData, int numInputChannels, int numSamples);
+    void extraInputAboutToStart(int slot, juce::AudioIODevice* device);
+    void extraInputStopped(int slot);
+    // Close an extra device but KEEP its desiredDeviceName (transient close for
+    // stop/reconfigure); reopenDesiredExtraInputs() restores them after a (re)start.
+    bool closeExtraInputDevice(int slot);
+    void reopenDesiredExtraInputs();
+
+    // Shared fan-out used by both the primary and each extra device's callback:
+    // mix every active source bound to `deviceKey` into `mixBuf` (using the
+    // caller-owned `monitorScratch` for the N>1 render so concurrent device
+    // threads never share scratch). Returns the active source count for that key.
+    int mixSourcesForDevice(int deviceKey, const float* const* inputData, int numInputChannels,
+                            juce::AudioBuffer<float>& mixBuf, juce::AudioBuffer<float>& monitorScratch,
+                            int effectiveOutputChannels, int numSamples);
+    // Pack a stereo block into a packed-uint64 SPSC ring (producer side).
+    void packStereoIntoRing(const juce::AudioBuffer<float>& buf, int numSamples,
+                            std::array<std::atomic<uint64_t>, kOutputRingFrames>& ring,
+                            std::atomic<uint64_t>& writeIndex);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioEngine)
 };

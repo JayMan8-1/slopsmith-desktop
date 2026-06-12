@@ -234,7 +234,9 @@ const slopsmithDesktopApi = {
 
         // Metering (polled at 60fps from renderer)
         getLevels: () => ipcRenderer.invoke('audio:getLevels'),
+        getSourceLevels: (id: number) => ipcRenderer.invoke('audio:getSourceLevels', id),
         resetPeaks: () => ipcRenderer.invoke('audio:resetPeaks'),
+        getBackingLevel: (): Promise<number> => ipcRenderer.invoke('audio:getBackingLevel'),
 
         // Pitch detection (polled). Backed by the polyphonic ML detector
         // (Basic Pitch) when a model is loaded, else the YIN detector —
@@ -301,6 +303,56 @@ const slopsmithDesktopApi = {
         detectNotes: (): Promise<NoteDetection | null> =>
             ipcRenderer.invoke('audio:detectNotes'),
 
+        // ── Multi-input sources ──────────────────────────────────────────────
+        // Each source is an independent input chain (own arrangement chart, note
+        // detection, scoring, tone, monitor). sources[0] always exists and is
+        // what the legacy un-suffixed methods above target. A renderer that wants
+        // more than one player adds a source per extra input and drives its
+        // scoring via the *Source* methods. All resolve to safe defaults on a
+        // downlevel addon so the caller feature-detects.
+
+        // Activate a pooled input chain bound to `inputChannel` (-1 = mono mix of
+        // the first pair). Resolves the new sourceId, or -1 if the pool is full /
+        // unsupported.
+        // deviceKey routes the source to an additional bound input device (0 =
+        // primary). Resolves the new sourceId, or -1 if the pool is full / unsupported.
+        addSource: (inputChannel?: number, deviceKey?: number): Promise<number> =>
+            ipcRenderer.invoke('audio:addSource', inputChannel, deviceKey),
+        removeSource: (id: number): Promise<boolean> =>
+            ipcRenderer.invoke('audio:removeSource', id),
+        listSources: (): Promise<Array<{ id: number; inputChannel: number; deviceKey: number; active: boolean }> | null> =>
+            ipcRenderer.invoke('audio:listSources'),
+        // Phase 2 multi-device: list capture devices + bind/unbind an additional
+        // input device (deviceKey 1..N) so a source can capture from it directly.
+        listInputDevices: (): Promise<Array<{ typeName: string; name: string }> | null> =>
+            ipcRenderer.invoke('audio:listInputDevices'),
+        bindInputDevice: (deviceKey: number, deviceName: string): Promise<string> =>
+            ipcRenderer.invoke('audio:bindInputDevice', deviceKey, deviceName),
+        unbindInputDevice: (deviceKey: number): Promise<boolean> =>
+            ipcRenderer.invoke('audio:unbindInputDevice', deviceKey),
+        setSourceInputChannel: (id: number, channel: number): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceInputChannel', id, channel),
+        setSourceVerifierOffset: (id: number, seconds: number): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceVerifierOffset', id, seconds),
+        setSourceMonitorMute: (id: number, mute: boolean): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceMonitorMute', id, mute),
+
+        // Per-source twins of setChart / scoreChord / getNoteVerdicts /
+        // getRawAudioFrame / getPitchDetection — same shapes, the leading id
+        // selects the source.
+        setSourceChart: (id: number, chart: ChartUpdate): Promise<boolean | null> =>
+            ipcRenderer.invoke('audio:setSourceChart', id, chart),
+        scoreSourceChord: (id: number, ctx: ChordScoreRequest): Promise<ChordScoreResult | null> =>
+            ipcRenderer.invoke('audio:scoreSourceChord', id, ctx),
+        getSourceNoteVerdicts: (id: number, songTime?: number, playing?: boolean): Promise<NoteVerdict[] | null> =>
+            ipcRenderer.invoke('audio:getSourceNoteVerdicts', id, songTime, playing),
+        getSourceRawAudioFrame: (id: number, numSamples?: number): Promise<Float32Array> =>
+            ipcRenderer.invoke('audio:getSourceRawAudioFrame', id, numSamples),
+        getSourcePitchDetection: (id: number) =>
+            ipcRenderer.invoke('audio:getSourcePitchDetection', id),
+        getSourceRawPitch: (id: number) =>
+            ipcRenderer.invoke('audio:getSourceRawPitch', id),
+
         // VST plugins
         scanPlugins: (dirs?: string[]) => ipcRenderer.invoke('audio:scanPlugins', dirs),
         getKnownPlugins: () => ipcRenderer.invoke('audio:getKnownPlugins'),
@@ -349,6 +401,19 @@ const slopsmithDesktopApi = {
         // Tone switching
         setMultiBypass: (changes: Array<{slotId: number, bypassed: boolean}>) =>
             ipcRenderer.invoke('audio:setMultiBypass', changes),
+    },
+
+    // Trusted executor for core audio-effects chain plans. Providers pass
+    // opaque plan refs through core; desktop receives the private asset map,
+    // validates the plan, and physically loads/applies native stages.
+    audioEffects: {
+        loadChainPlan: (request: unknown) => ipcRenderer.invoke('audio-effects:loadChainPlan', request),
+        releaseRoute: (request: unknown) => ipcRenderer.invoke('audio-effects:releaseRoute', request),
+        inspectRoute: (routeKey?: string) => ipcRenderer.invoke('audio-effects:inspectRoute', routeKey),
+        activateSegment: (request: unknown) => ipcRenderer.invoke('audio-effects:activateSegment', request),
+        setStageBypass: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageBypass', request),
+        setStageParameter: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageParameter', request),
+        setRouteGain: (request: unknown) => ipcRenderer.invoke('audio-effects:setRouteGain', request),
     },
 
     // Plugin management

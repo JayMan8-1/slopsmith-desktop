@@ -26,6 +26,11 @@ libwebkit2gtk-4.1-dev
 pkg-config
 cmake
 build-essential
+# GCC 12+ for the NAM A2 (slimmable) sources, which use
+# std::atomic<std::shared_ptr<...>> — a C++20 library feature libstdc++ only
+# implements from GCC 12. ubuntu-22.04's default (build-essential) g++ is 11;
+# build-audio.sh selects g++-12 when the default is older.
+g++-12
 
 # File operations (used by bundle-slopsmith.sh to resolve symlinked plugins)
 rsync

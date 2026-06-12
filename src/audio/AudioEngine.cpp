@@ -2,7 +2,9 @@
 #include "AudioSanitize.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
 
 // Hard ceiling on backing playback speed. This drives input buffer sizing and runtime clamp.
 static constexpr double kMaxBackingSpeed = 4.0;
@@ -17,6 +19,26 @@ static constexpr double kBackingSpeedBypassEpsilon = 1.0e-4;
 AudioEngine::AudioEngine()
 {
     formatManager.registerBasicFormats();
+
+    // Construct the full source pool up front so addSource/removeSource never
+    // reassign a pointer the audio thread reads — they only flip `active`. Each
+    // chain reads the engine's audioRunning / currentSampleRate atomics by
+    // reference (both already constructed as members before this body runs).
+    // sources[0] is the permanent default input, active from the start; the rest
+    // are inactive (no threads — NoteVerifier's worker only starts in prepare()).
+    for (int i = 0; i < kMaxSources; ++i)
+        sources[(size_t) i] = std::make_unique<SourceChain>(i, audioRunning, currentSampleRate);
+    sources[0]->setActive(true);
+
+    // Phase 2: tag each additional-input slot with its identity so its JUCE
+    // callback can route back to the engine. deviceKey = slot index + 1 (0 is the
+    // primary inputDeviceManager). The managers stay idle until bindInputDevice.
+    for (int i = 0; i < kMaxExtraInputDevices; ++i)
+    {
+        extraInputs[(size_t) i].callback.engine = this;
+        extraInputs[(size_t) i].callback.slot = i;
+        extraInputs[(size_t) i].deviceKey = i + 1;
+    }
 
     auto result = inputDeviceManager.initialiseWithDefaultDevices(2, 2);
     if (result.isNotEmpty())
@@ -45,6 +67,13 @@ AudioEngine::AudioEngine()
 
 AudioEngine::~AudioEngine()
 {
+    // Stop every extra input device FIRST so no slot callback can fire into a
+    // half-destroyed engine. closeAudioDevice blocks for the callback thread.
+    for (int i = 0; i < kMaxExtraInputDevices; ++i)
+    {
+        extraInputs[(size_t) i].manager.closeAudioDevice();
+        extraInputs[(size_t) i].manager.removeAudioCallback(&extraInputs[(size_t) i].callback);
+    }
     stopAudio();
     stopBacking();
 }
@@ -68,6 +97,49 @@ juce::Array<AudioEngine::DeviceTypeInfo> AudioEngine::getDeviceTypes()
     }
 
     return types;
+}
+
+std::vector<AudioEngine::BindableInput> AudioEngine::getBindableInputDevices()
+{
+    std::vector<BindableInput> out;
+    // The device already open as the primary input IS "Main" — don't offer it as
+    // an extra (would double-open the same hardware on two managers).
+    juce::String primaryName;
+    if (auto* dev = inputDeviceManager.getCurrentAudioDevice())
+        primaryName = dev->getName();
+    // Enumerate across ALL device types, not just the primary's current one —
+    // bindInputDevice() can open a device under any backend (JACK/ALSA/CoreAudio/…),
+    // so an extra interface exposed under a DIFFERENT backend than the primary must
+    // still be offered, or the multi-device path is unreachable from the picker.
+    //
+    // KNOWN LIMITATION: identity is the display name. JUCE opens input devices BY
+    // NAME, so two interfaces sharing a label (e.g. two identical USB cables) cannot
+    // be distinguished or independently opened without a backend-specific device-id
+    // rework — they collapse to one entry here. The SAME root cause makes a device
+    // exposed under MULTIPLE backends (e.g. ALSA + JACK/PipeWire on Linux) ambiguous:
+    // we dedup by name and bindInputDevice() re-derives the backend (preferring the
+    // primary's), so we may bind the wrong backend if only another would open. A real
+    // fix needs (typeName, name) identity threaded through bind/reopen. Distinct-name,
+    // single-backend rigs (the common case, and the validated GP-5 + Spark setup) are
+    // unaffected.
+    juce::StringArray seen;
+    for (auto* t : inputDeviceManager.getAvailableDeviceTypes())
+    {
+        if (!t) continue;
+        t->scanForDevices();
+        const juce::String typeName = t->getTypeName();
+        for (const auto& name : t->getDeviceNames(true))
+        {
+            if (name == primaryName || seen.contains(name)) continue;  // dedup across backends
+            // Skip monitor / loopback pseudo-inputs — not instrument inputs, only
+            // confuse the picker.
+            const juce::String lower = name.toLowerCase();
+            if (lower.contains("monitor") || lower.contains("loopback")) continue;
+            seen.add(name);
+            out.push_back({ typeName, name });
+        }
+    }
+    return out;
 }
 
 juce::Array<double> AudioEngine::getSampleRates()
@@ -561,6 +633,10 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
     // (R9 fix — removeAudioCallback is a no-op when not registered), so
     // running it unconditionally is safe regardless of audioRunning.
     const bool wasRunning = audioRunning.load(std::memory_order_relaxed);
+
+    // stopAudio() closes every extra input device but KEEPS its desiredDeviceName;
+    // the startAudio() below re-opens them at the new config (so panels using a
+    // second interface survive a device/sample-rate/buffer change automatically).
     stopAudio();
 
     // setCurrentAudioDeviceType can throw from inside JUCE backends (ASIO
@@ -621,6 +697,9 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
             : 48000.0;
     const int requestedBufferSize = config.bufferSize > 0 ? config.bufferSize : 256;
 
+    // (Extra input devices were closed by the stopAudio() above with their intent
+    // kept; startAudio() below re-opens them at the new config — split mode only.)
+
     if (isDuplex)
     {
         teardownSplitMode();
@@ -660,7 +739,11 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
         duplexMode.store(false, std::memory_order_relaxed);
     }
 
+    // startAudio() re-opens the desired extra input devices at the new config
+    // (bindInputDevice forces + verifies the new rate). If the engine was not
+    // running, they stay closed with their intent kept until the next startAudio().
     if (wasRunning) startAudio();
+
     return res;
 }
 
@@ -794,15 +877,13 @@ juce::String AudioEngine::applyDuplexSetup(const juce::String& inputName,
         fprintf(stderr, "[AudioEngine] Actual device setup: sr=%.0f bs=%d (requested bs=%d)\n",
                 sr, bs, bufferSize);
 
-        signalChain.prepare(sr, bs);
-        noiseGate.prepare(sr, bs);
-        tonePolish.prepare(sr);
+        source0().prepareMonitorChain(sr, bs);
         return {};
     }
     currentSampleRate.store(0.0, std::memory_order_relaxed);
     inputBlockSize.store(0, std::memory_order_relaxed);
     outputBlockSize.store(0, std::memory_order_relaxed);
-    signalChain.releaseResources();
+    source0().releaseMonitorChain();
     return "no current device after setup";
 }
 
@@ -1058,9 +1139,7 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     for (auto& slot : outputPendingRing)
         slot.store(0u, std::memory_order_relaxed);
 
-    signalChain.prepare(inSr, inBs);
-    noiseGate.prepare(inSr, inBs);
-    tonePolish.prepare(inSr);
+    source0().prepareMonitorChain(inSr, inBs);
 
     res.ok = true;
     res.sampleRate = inSr;
@@ -1118,6 +1197,11 @@ void AudioEngine::startAudio()
                 ? inputDeviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "none",
             outputDeviceManager.getCurrentAudioDevice()
                 ? outputDeviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "(duplex)");
+
+    // Restore any extra input devices the user still wants bound (stopAudio closed
+    // them but kept the intent). This is what makes a stop/start cycle or a device
+    // reconfigure transparently resume multi-input detection.
+    reopenDesiredExtraInputs();
 }
 
 void AudioEngine::stopAudio()
@@ -1132,7 +1216,16 @@ void AudioEngine::stopAudio()
     outputDeviceManager.removeAudioCallback(&outputCallback);
     outputCallbackRegistered = false;
     inputDeviceManager.removeAudioCallback(this);
+    // Extra input devices are opened independently of startAudio(); close them here
+    // too so a stopped engine never leaves a second interface capturing, feeding
+    // detectors, and holding the hardware open in the background. KEEP their
+    // desiredDeviceName so the next startAudio() re-opens them (a stop/start cycle,
+    // or a device reconfigure, restores extra inputs automatically). No-op when none
+    // are bound — the single-device path is unchanged.
+    for (int dk = 1; dk <= kMaxExtraInputDevices; ++dk)
+        closeExtraInputDevice(dk - 1);
     audioRunning.store(false, std::memory_order_relaxed);
+    currentBackingLevel.store(0.0f);
 }
 
 // ── Backing Track ─────────────────────────────────────────────────────────────
@@ -1248,6 +1341,7 @@ void AudioEngine::stopBackingNoLock()
         backingStretch.reset();
         backingPlaying.store(false);
     }
+    currentBackingLevel.store(0.0f);
 }
 
 void AudioEngine::stopBacking()
@@ -1293,8 +1387,193 @@ void AudioEngine::setBackingSpeed(double speed)
 
 void AudioEngine::resetPeaks()
 {
-    inputPeak.store(0.0f);
+    // Input peak is per-source — clear EVERY active source (getSourceLevels() exposes
+    // each one's peak), not just source 0, or extra-device peaks latch forever.
+    for (auto& src : sources)
+        if (src->isActive())
+            src->resetInputPeak();
     outputPeak.store(0.0f);
+}
+
+// ── Multi-input source management (control thread) ───────────────────────────
+
+int AudioEngine::addSource(int inputChannel, int deviceKey)
+{
+    // Only deviceKey 0 (primary) and 1..kMaxExtraInputDevices are ever serviced by
+    // a callback. An out-of-range key (e.g. stale persisted state) would make an
+    // "active" source that mixSourcesForDevice never processes — a ghost that never
+    // detects or outputs. Fail fast instead.
+    if (deviceKey < 0 || deviceKey > kMaxExtraInputDevices)
+        return -1;
+    // An extra-device source is only ever serviced by that device's callback, so the
+    // device must be BOUND — either currently open (active) or DEFERRED (validated +
+    // desired while the engine is stopped, to be reopened by startAudio()). Reject
+    // only when the slot is neither: a stale persisted deviceKey, or a slot a
+    // reconfigure fully unbound. A deferred source is added now and resumes when its
+    // device reopens; without this, a panel restored while audio is stopped can never
+    // configure its detector even though the device was successfully (deferred-)bound.
+    if (deviceKey >= 1)
+    {
+        const InputDeviceSlot& es = extraInputs[(size_t) (deviceKey - 1)];
+        if (! es.active.load(std::memory_order_acquire) && es.desiredDeviceName.isEmpty())
+            return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(sourcesMutex);
+    reclaimPendingReleases();  // free up any slot whose release was deferred
+
+    // Find a free pooled slot (slot 0 is the permanent default). Skip a slot whose
+    // release is still pending — its chain/worker hasn't been torn down yet, so
+    // re-preparing it would double-start the verifier thread.
+    int slot = -1;
+    for (int i = 1; i < kMaxSources; ++i)
+        if (! sources[(size_t) i]->isActive() && ! pendingRelease[(size_t) i]) { slot = i; break; }
+    if (slot < 0)
+        return -1;  // pool full
+
+    SourceChain& src = *sources[(size_t) slot];
+    src.setInputChannel(inputChannel);
+    src.setDeviceKey(deviceKey);
+    // Inherit the bound device's capture-latency correction (0 for the primary).
+    // The device usually started before the source was created (the user picks the
+    // device, then enables detect), so its delta is already known.
+    if (deviceKey >= 1 && deviceKey <= kMaxExtraInputDevices)
+        src.setVerifierAutoOffset(extraInputs[(size_t) (deviceKey - 1)].latencyDeltaSec.load(std::memory_order_relaxed));
+    else
+        src.setVerifierAutoOffset(0.0);
+    // Clear any MANUAL offset left on this pooled chain by a previous player — a
+    // freshly added source starts with no user fine-tune (the renderer re-applies
+    // its own via setSourceVerifierOffset). releaseResources() doesn't touch it.
+    src.setVerifierUserOffset(0.0);
+    // Likewise clear stale meters so this source doesn't briefly report the previous
+    // player's level/peak through getSourceLevels() until fresh audio arrives.
+    src.resetInputMeters();
+
+    // Prepare fully BEFORE making it visible to the audio thread, so the first
+    // callback that observes active==true sees a ready chain + rings. When audio
+    // isn't running yet, audioDeviceAboutToStart (primary) / extraInputAboutToStart
+    // (extra) prepares it later. An EXTRA-device source must be prepared with ITS
+    // device's sample rate / block size, not the primary's — the two can differ.
+    bool deviceReady = audioRunning.load(std::memory_order_relaxed);
+    double sr = currentSampleRate.load(std::memory_order_relaxed);
+    int bs = inputBlockSize.load(std::memory_order_relaxed);
+    if (deviceKey >= 1 && deviceKey <= kMaxExtraInputDevices)
+    {
+        const InputDeviceSlot& es = extraInputs[(size_t) (deviceKey - 1)];
+        deviceReady = es.active.load(std::memory_order_acquire);
+        sr = es.sampleRate.load(std::memory_order_relaxed);
+        bs = es.blockSize.load(std::memory_order_relaxed);
+    }
+    if (deviceReady && sr > 0.0 && bs > 0)
+        src.prepare(sr, bs);
+    src.setActive(true);  // release-store: now picked up by the audio callback
+    return slot;
+}
+
+bool AudioEngine::removeSource(int id)
+{
+    if (id <= 0 || id >= kMaxSources)
+        return false;  // 0 is permanent; out-of-range rejected
+
+    std::lock_guard<std::mutex> lock(sourcesMutex);
+    reclaimPendingReleases();  // opportunistically reclaim earlier deferrals
+
+    SourceChain& src = *sources[(size_t) id];
+    if (! src.isActive())
+        return false;
+
+    // Hide it from the audio callback first; subsequent blocks snapshot active
+    // once and skip it. It is logically removed from here on, regardless of when
+    // its resources are reclaimed.
+    src.setActive(false);
+
+    // Reclaim now if we can confirm THIS SOURCE's device callback is not executing.
+    // Only the callback for the source's own deviceKey can touch it; that counter is
+    // decremented at the callback's real exit (release store), so observing 0
+    // (acquire) proves it is not inside processBlock right now; any callback that
+    // starts afterwards snapshots active and skips this (now-inactive) source — so
+    // releasing cannot race the audio thread. Keying on the source's deviceKey (not a
+    // global all-callbacks-idle check) is what lets removals reclaim during steady
+    // multi-device playback, when callbacks on independent clocks are never all idle
+    // at once. Bounded so a wedged device can't hang this thread.
+    const size_t dk = (size_t) src.getDeviceKey();
+    for (int spins = 0; spins < 200; ++spins)  // ~200 ms cap
+    {
+        if (callbacksInFlight[dk].load(std::memory_order_acquire) == 0)
+        {
+            src.releaseResources();  // stops its threads + releases its chain
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // A callback stayed wedged in-flight past the wait (a >200 ms block would be a
+    // catastrophic stall). Do NOT force a release that could race it — DEFER it.
+    // The source is already inactive so no future callback touches it; reclaim it
+    // later (next add/removeSource, or audioDeviceStopped) when the body is quiet.
+    pendingRelease[(size_t) id] = true;
+    return true;
+}
+
+void AudioEngine::reclaimPendingReleases()
+{
+    // Caller holds sourcesMutex. A deferred source is inactive (future callbacks skip
+    // it); releasing it is safe once the callback for ITS deviceKey is not in a body.
+    // We key per-deviceKey (decremented by each callback at its real exit) so a
+    // pending release frees as soon as its OWN device is quiescent — not only when
+    // every device callback happens to be idle simultaneously (which, on independent
+    // clocks during steady multi-device playback, may never occur and would strand
+    // the slot until full stop). On the audioDeviceStopped path the relevant callback
+    // already left its count at 0.
+    for (int i = 1; i < kMaxSources; ++i)
+    {
+        if (! pendingRelease[(size_t) i]) continue;
+        const size_t dk = (size_t) sources[(size_t) i]->getDeviceKey();
+        if (callbacksInFlight[dk].load(std::memory_order_acquire) != 0)
+            continue;  // this source's device is mid-body — try again later
+        sources[(size_t) i]->releaseResources();
+        pendingRelease[(size_t) i] = false;
+    }
+}
+
+// Lifetime/threading of getSource() + the NodeAddon *Source* methods:
+//  - getSource(), add/removeSource(), and the source-indexed methods all run on
+//    the single N-API/JS thread (V8-serialised), so a source can't be removed out
+//    from under a getSource() caller on that thread.
+//  - getSource() returns a pointer into the FIXED pool. releaseResources() (from
+//    removeSource or audioDeviceStopped) only stops the chain's threads + resets
+//    its rings — it NEVER frees the SourceChain object — so the pointer never
+//    dangles for the life of the engine (no use-after-free).
+//  - The only cross-thread overlap is a source-indexed method (N-API) running
+//    concurrently with audioDeviceStopped's releaseResources() (device thread).
+//    That window is IDENTICAL to the pre-existing legacy methods (scoreChord /
+//    getNoteVerdicts / getRawAudioFrame, which all operate on source 0's same
+//    chain) and is handled the same way: each component's internals are atomic /
+//    individually thread-safe, and the rings are lock-free. This change adds no
+//    new race class versus the original single-source engine.
+SourceChain* AudioEngine::getSource(int id)
+{
+    if (id < 0 || id >= kMaxSources)
+        return nullptr;
+    SourceChain& src = *sources[(size_t) id];
+    return (id == 0 || src.isActive()) ? &src : nullptr;
+}
+
+std::vector<AudioEngine::SourceInfo> AudioEngine::listSources() const
+{
+    std::vector<SourceInfo> out;
+    for (int i = 0; i < kMaxSources; ++i)
+    {
+        const SourceChain& src = *sources[(size_t) i];
+        if (! src.isActive()) continue;
+        SourceInfo info;
+        info.id = src.getId();
+        info.inputChannel = src.getInputChannel();
+        info.deviceKey = src.getDeviceKey();
+        info.active = true;
+        out.push_back(info);
+    }
+    return out;
 }
 
 int AudioEngine::renderBackingBlockLocked(int numSamples)
@@ -1402,15 +1681,8 @@ int AudioEngine::renderBackingBlockLocked(int numSamples)
     return outSamples;
 }
 
-void AudioEngine::setNoiseGate(bool enabled, float thresholdDb, float releaseMs, float depthDb)
-{
-    noiseGate.setParameters(enabled, thresholdDb, releaseMs, depthDb);
-}
-
-void AudioEngine::setTonePolishEnabled(bool enabled)
-{
-    tonePolish.setEnabled(enabled);
-}
+// setNoiseGate / setTonePolishEnabled are now inline forwarders to sources[0]
+// (see AudioEngine.h).
 
 // ── Audio Callback ────────────────────────────────────────────────────────────
 
@@ -1433,26 +1705,6 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     if (duplexMode.load(std::memory_order_relaxed))
         outputBlockSize.store(bs, std::memory_order_relaxed);
 
-    // Reset the input ring buffer so a stop→start cycle delivers a
-    // clean zero-padded cold-start frame instead of mixing in stale
-    // samples from the previous run. Plain relaxed stores are fine —
-    // the audio thread isn't running yet (this is the device-start
-    // hook), so there's no race to worry about here.
-    inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
-    for (auto& slot : inputFrameRing)
-        slot.store(0.0f, std::memory_order_relaxed);
-
-    // Same clean cold-start for the post-gate tuner ring.
-    rawAudioRingWriteIndex.store(0, std::memory_order_relaxed);
-    for (auto& slot : rawAudioRing)
-        slot.store(0.0f, std::memory_order_relaxed);
-
-    // Pre-size the zero-output capture scratch to this device's block
-    // size so the audio thread doesn't allocate when we hit that path.
-    // For the common output > 0 case this storage stays unused.
-    if ((int) inputCaptureScratch.size() < bs)
-        inputCaptureScratch.assign((size_t) bs, 0.0f);
-
     // Input callback uses outputBackingBuffer as DSP scratch in split mode.
     // Pre-size against input block size so the hot path can't allocate when
     // inputBlockSize > outputBlockSize (audioOutputAboutToStart only sizes
@@ -1463,12 +1715,19 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
         outputBackingBuffer.setSize(2, bs, false, false, true);
     }
 
-    signalChain.prepare(sr, bs);
-    pitchDetector.prepare(sr, bs);
-    mlNoteDetector.prepare(sr, bs);
-    noteVerifier.prepare(sr, bs);
-    noiseGate.prepare(sr, bs);
-    tonePolish.prepare(sr);
+    // Pre-size the multi-source mix scratch (2ch) so the audio thread never
+    // allocates when summing active sources.
+    if (sourceMonitorScratch.getNumSamples() < bs)
+        sourceMonitorScratch.setSize(2, bs, false, false, true);
+
+    // Prepare each ACTIVE PRIMARY-device source's DSP and reset its rings for a
+    // clean cold start. Inactive pooled chains stay unprepared (no threads). EXTRA-
+    // device sources (deviceKey > 0) are prepared by their own extraInputAboutToStart
+    // with THAT device's format — a primary restart must not clobber them with the
+    // primary's sample rate / block size (they run on a different hardware clock).
+    for (auto& src : sources)
+        if (src->isActive() && src->getDeviceKey() == 0)
+            src->prepare(sr, bs);
 
     // Split mode preps the backing stretcher in audioOutputAboutToStart
     // instead — that callback owns the device the backing audio actually
@@ -1495,14 +1754,27 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 
 void AudioEngine::audioDeviceStopped()
 {
-    signalChain.releaseResources();
-    mlNoteDetector.stop();
-    noteVerifier.stop();
-    inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
-    rawAudioRingWriteIndex.store(0, std::memory_order_relaxed);
+    // JUCE calls audioDeviceStopped() only AFTER the PRIMARY input device has
+    // stopped invoking its IO callback (stop() blocks for the callback thread to
+    // finish), so the primary body is quiescent here. We release ONLY deviceKey-0
+    // sources: an EXTRA-device source is processed by that device's own callback,
+    // which may still be running on its own thread — releasing it here would race.
+    // Extra sources are released by extraInputStopped()/unbindInputDevice().
+    audioRunning.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(sourcesMutex);
+        // Release each ACTIVE primary-device source's chain and zero its rings.
+        // Inactive pooled chains were never prepared.
+        for (auto& src : sources)
+            if (src->isActive() && src->getDeviceKey() == 0)
+                src->releaseResources();
+        // Reclaim deferred removals only when ALL callback bodies are quiescent
+        // (an extra-device callback could still be mid-block).
+        reclaimPendingReleases();
+    }
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
-    audioRunning.store(false, std::memory_order_relaxed);
+    currentBackingLevel.store(0.0f);
 
     // Note on split-mode lifecycle: we deliberately do NOT detach the
     // output callback here. JUCE auto-restarts a transiently-stopped input
@@ -1589,6 +1861,11 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     float* const* outputData, int numOutputChannels,
     int numSamples, const juce::AudioIODeviceCallbackContext&)
 {
+    // Publish that the callback body is executing so removeSource() and deferred-
+    // release reclamation know when no source is being processed (the body is
+    // quiescent) and a removed source can be safely released. Index 0 = primary.
+    callbacksInFlight[0].fetch_add(1, std::memory_order_acq_rel);
+
     const bool duplex = duplexMode.load(std::memory_order_relaxed);
 
     // Duplex writes outputData directly. Split runs DSP into a private 2-channel
@@ -1615,204 +1892,25 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
     const int effectiveOutputChannels = duplex ? numOutputChannels : 2;
 
-    float inGain = inputGain.load();
-    int selectedCh = selectedInputChannel.load();
-
-    // Copy input with gain, handling channel selection. Track how
-    // many output channels we've filled so the "zero extras" pass
-    // below can clip to the right range — the broadcast branches
-    // fill all of them, the pass-through branch only fills the
-    // overlap.
-    int filledOutputChannels = 0;
-    if (numInputChannels >= 2 && selectedCh >= 0 && selectedCh < numInputChannels)
-    {
-        // Single-channel mode (e.g. dry from Valeton GP-5 left channel).
-        // Broadcast the selected input across all output channels.
-        for (int outCh = 0; outCh < effectiveOutputChannels; ++outCh)
-            for (int i = 0; i < numSamples; ++i)
-                buffer.setSample(outCh, i, inputData[selectedCh][i] * inGain);
-        filledOutputChannels = effectiveOutputChannels;
-    }
-    else if (selectedCh < 0 && numInputChannels > 1)
-    {
-        // Default pair mono mix: average the first two input channels
-        // and broadcast the result to every output channel, so the
-        // signal chain, pitch detector, input-frame ring, and the
-        // user's monitoring all see the same mono signal. We open all
-        // advertised hardware inputs so explicit higher channel picks
-        // work, but the default keeps the old first-pair semantics
-        // instead of attenuating the signal by averaging every input.
-        const int mixChannels = juce::jmin(numInputChannels, 2);
-        const float invCh = 1.0f / (float) mixChannels;
-        for (int i = 0; i < numSamples; ++i)
-        {
-            float mix = 0.0f;
-            for (int ch = 0; ch < mixChannels; ++ch)
-                mix += inputData[ch][i];
-            const float gained = mix * invCh * inGain;
-            for (int outCh = 0; outCh < effectiveOutputChannels; ++outCh)
-                buffer.setSample(outCh, i, gained);
-        }
-        filledOutputChannels = effectiveOutputChannels;
-    }
-    else
-    {
-        // Pass-through: single-input device, or stereo in/out with no
-        // explicit channel selection and no need to mix.
-        const int passThroughChannels = juce::jmin(numInputChannels, effectiveOutputChannels);
-        for (int ch = 0; ch < passThroughChannels; ++ch)
-            for (int i = 0; i < numSamples; ++i)
-                buffer.setSample(ch, i, inputData[ch][i] * inGain);
-        filledOutputChannels = passThroughChannels;
-    }
-
-    // Zero anything we didn't fill. Previously this was hard-coded to
-    // start at numInputChannels, which on a 2-in/4-out broadcast
-    // config would have wiped the upper two channels we just wrote.
-    for (int ch = filledOutputChannels; ch < effectiveOutputChannels; ++ch)
-        buffer.clear(ch, 0, numSamples);
-
-    // Metering: input level (pre-processing)
-    {
-        float peak = 0.0f;
-        for (int ch = 0; ch < effectiveOutputChannels; ++ch)
-            peak = juce::jmax(peak, buffer.getMagnitude(ch, 0, numSamples));
-        currentInputLevel.store(peak);
-        float prevPeak = inputPeak.load();
-        if (peak > prevPeak) inputPeak.store(peak);
-    }
-
-    // Build the mono guitar source. The ML detector and the getInputFrame() ring
-    // are fed here, pre-gate (note-detection scoring expects the raw dry signal);
-    // the YIN pitch detector is fed lower down, AFTER the noise gate (both the
-    // monitored path and the zero-output fallback), so the tuner reads silence as
-    // "no pitch" instead of chasing gated noise. Buffer ch 0 holds the post-gain
-    // mono signal in both duplex and split paths. Zero-output duplex setups
-    // (input-only ASIO/JACK) need the scratch fallback.
-    const float* monoSource = nullptr;
-    if (effectiveOutputChannels > 0)
-    {
-        monoSource = buffer.getReadPointer(0);
-    }
-    else if (numInputChannels > 0 && (int) inputCaptureScratch.size() >= numSamples)
-    {
-        // Build the mono source mirroring the channel-copy semantics:
-        // explicit channel select picks one input; -1 with multi-input
-        // averages the first pair; otherwise input channel 0.
-        if (selectedCh >= 0 && selectedCh < numInputChannels)
-        {
-            for (int i = 0; i < numSamples; ++i)
-                inputCaptureScratch[(size_t) i] = inputData[selectedCh][i] * inGain;
-        }
-        else if (selectedCh < 0 && numInputChannels > 1)
-        {
-            const int mixChannels = juce::jmin(numInputChannels, 2);
-            const float invCh = 1.0f / (float) mixChannels;
-            for (int i = 0; i < numSamples; ++i)
-            {
-                float mix = 0.0f;
-                for (int ch = 0; ch < mixChannels; ++ch)
-                    mix += inputData[ch][i];
-                inputCaptureScratch[(size_t) i] = mix * invCh * inGain;
-            }
-        }
-        else
-        {
-            for (int i = 0; i < numSamples; ++i)
-                inputCaptureScratch[(size_t) i] = inputData[0][i] * inGain;
-        }
-        monoSource = inputCaptureScratch.data();
-    }
-
-    if (monoSource != nullptr)
-    {
-        // Feed the polyphonic ML detector the dry mono signal (pre-gate). Lock-free
-        // and a no-op when ONNX support isn't compiled in.
-        mlNoteDetector.pushSamples(monoSource, numSamples);
-
-        // Mirror the same signal into the lock-free ring buffer that
-        // backs getInputFrame(). The release-store on the write index
-        // pairs with the main-thread reader's acquire load so every
-        // sample written below is visible before the index update.
-        // Per-slot stores are atomic-relaxed so the concurrent read
-        // by getInputFrame() isn't a data race (UB) when the writer
-        // laps mid-snapshot.
-        const uint64_t w = inputFrameRingWriteIndex.load(std::memory_order_relaxed);
-        constexpr int kMask = kInputFrameRingCapacity - 1;
-        for (int i = 0; i < numSamples; ++i)
-            inputFrameRing[(w + (uint64_t) i) & (uint64_t) kMask]
-                .store(monoSource[i], std::memory_order_relaxed);
-        inputFrameRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
-    }
-
-    noiseGate.processBlock(buffer);
-
-    // Feed the YIN pitch detector from the POST-gate signal so the tuner reports
-    // silence as "no pitch" instead of chasing gated noise.
-    if (monoSource != nullptr)
-    {
-        if (effectiveOutputChannels > 0)
-        {
-            // monoSource aliases buffer ch0, which the gate just processed in place.
-            pitchDetector.pushSamples(monoSource, numSamples);
-            // Same post-gate samples feed the tuner's raw-audio ring.
-            pushRawAudioFrame(monoSource, numSamples);
-        }
-        else
-        {
-            // Zero-output (input-only ASIO/JACK) fallback: buffer has no channel,
-            // so the processBlock above was a no-op (NoiseGate early-returns and
-            // leaves its envelope untouched when numChannels <= 0). Run the gate
-            // once on the scratch mono here — a single real gate pass — so the
-            // tuner is gated in this path too. ML / input-frame ring already
-            // copied the pre-gate samples above, so gating in place is safe.
-            float* scratchPtr = inputCaptureScratch.data();
-            juce::AudioBuffer<float> scratchGate(&scratchPtr, 1, numSamples);
-            noiseGate.processBlock(scratchGate);
-            pitchDetector.pushSamples(scratchPtr, numSamples);
-            pushRawAudioFrame(scratchPtr, numSamples);
-        }
-    }
-
-    // Process through signal chain (VSTs, NAM, IR)
-    bool hasProcessors = signalChain.getNumSlots() > 0;
-    juce::MidiBuffer midi;
-    signalChain.process(buffer, midi);
-
-    // Contain a divergent chain block before it reaches the IIR/gain/mix and
-    // the output: a NAM/IR/VST can emit NaN/Inf or a runaway level (esp. on a
-    // live chain rebuild during song load), which otherwise blasts the output
-    // and poisons persistent downstream state until an app restart (#403).
-    // Scrub here so feed-forward processors self-heal and the failure is a
-    // glitch, not a dead engine. Count flagged blocks (relaxed; RT-safe — no
-    // logging on the audio thread) for later observability.
-    if (hasProcessors)
-    {
-        int fixed = 0;
-        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
-            fixed += slopsmith::sanitizeAudioBlock(buffer.getWritePointer(ch), numSamples);
-        if (fixed > 0)
-            nonFiniteChainBlocks.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Monitor mute: silence the guitar pass-through when no processors are loaded.
-    // This prevents hearing raw/amp-processed input when the user hasn't set up a chain yet.
-    // Backing track still plays through. Suppressed during a song-load chain
-    // rebuild so the brief (or failed) empty-chain window doesn't silence the guitar.
-    if (monitorMuted.load() && !hasProcessors && !monitorMuteSuppressed.load())
-        buffer.clear();
-
-    // Chain output gain — the amp/tone's output level. Applied to the guitar
-    // signal ONLY, before the backing track is mixed in, so switching tone
-    // presets changes the guitar level without touching the song volume.
-    buffer.applyGain(chainOutputGain.load());
-
-    // Tone Polish — fixed 3-band mastering EQ (HPF 80 Hz, low shelf -3 dB
-    // @ 180 Hz, peak -0.5 dB @ 200 Hz Q=1). Sits on the guitar bus only,
-    // between chain output gain and the backing-track mix, so the backing
-    // track and master output gain stay bit-untouched. Bypassed at a
-    // single atomic load when disabled.
-    tonePolish.processBlock(buffer);
+    // Per-source capture + detect + monitor.
+    //
+    // Fast path — exactly one active source: process it in place on `buffer`,
+    // byte-identical to the single-pipeline engine (channel select / mono mix +
+    // input gain, input metering, ML + input-ring feed, noise gate, YIN + raw-ring
+    // feed, tone chain + NaN scrub, monitor mute, chain gain, tone polish).
+    //
+    // Multi-source path: each active source renders its own 2-channel monitor into
+    // sourceMonitorScratch (each builds its mono from its bound input channel +
+    // feeds its own rings/detectors/verifier), and the monitors are summed into the
+    // output. Each source scores its OWN arrangement independently.
+    // This is the PRIMARY input device's callback: it mixes only sources bound to
+    // device 0 (deviceKey == 0). Sources bound to an additional input device
+    // (Phase 2) are processed by that device's own callback on its own hardware
+    // clock — never here. With no extra device every source is deviceKey 0, so
+    // this is the single-device path unchanged. See mixSourcesForDevice for the
+    // fast-path / multi-source rationale; it is shared with each extra callback.
+    mixSourcesForDevice(0, inputData, numInputChannels, buffer, sourceMonitorScratch,
+                        effectiveOutputChannels, numSamples);
 
     // Duplex mixes backing + applies output gain + meters here.
     // Split defers all three to OutputCallback (output device's clock).
@@ -1824,8 +1922,27 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             const int outSamples = renderBackingBlockLocked(numSamples);
             const float bVol = backingVolume.load();
             const int mixChannels = juce::jmin(numOutputChannels, 2);
+            float backingLevelSq = 0.0f;
             for (int ch = 0; ch < mixChannels; ++ch)
+            {
+                const float* const src = backingBuffer.getReadPointer(ch);
+                float sumSquares = 0.0f;
+                for (int i = 0; i < outSamples; ++i)
+                    sumSquares += src[i] * src[i];
+
+                const float channelRms = (outSamples > 0)
+                    ? std::sqrt(sumSquares / outSamples) * bVol
+                    : 0.0f;
+                backingLevelSq += channelRms * channelRms;
                 buffer.addFrom(ch, 0, backingBuffer, ch, 0, outSamples, bVol);
+            }
+            currentBackingLevel.store((mixChannels > 0)
+                ? std::sqrt(backingLevelSq / mixChannels)
+                : 0.0f);
+        }
+        else
+        {
+            currentBackingLevel.store(0.0f);
         }
 
         // Apply output gain
@@ -1842,30 +1959,475 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     else
     {
         // Split: push processed stereo (pre-backing, pre-output-gain) into the
-        // ring. OutputCallback adds backing + output gain on its own clock.
-        //
-        // Strict SPSC: producer (this callback) only ever writes
-        // outputRingWriteIndex; consumer (audioOutputCallback) is the sole
-        // writer of outputRingReadIndex. Drop-oldest is achieved by letting
-        // writeIndex lap the buffer — old slots get overwritten in place,
-        // and the consumer catches up by advancing its own readIndex when
-        // it observes (w - r) > cap. Counting the overflow at the consumer
-        // side is what surfaces it in DeviceMetrics.
-        constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
-        const uint64_t w = outputRingWriteIndex.load(std::memory_order_relaxed);
+        // primary ring. OutputCallback adds backing + output gain on its own clock
+        // and sums every extra-device ring alongside this one.
+        packStereoIntoRing(buffer, numSamples, outputPendingRing, outputRingWriteIndex);
+    }
 
-        const float* L = buffer.getReadPointer(0);
-        const float* R = buffer.getReadPointer(1);
-        for (int i = 0; i < numSamples; ++i)
+    // Body done — this callback is no longer processing a source. Pairs with
+    // removeSource()/reclaimPendingReleases() acquire loads. Index 0 = primary.
+    callbacksInFlight[0].fetch_sub(1, std::memory_order_acq_rel);
+}
+
+int AudioEngine::mixSourcesForDevice(int deviceKey, const float* const* inputData, int numInputChannels,
+                                     juce::AudioBuffer<float>& mixBuf, juce::AudioBuffer<float>& monitorScratch,
+                                     int effectiveOutputChannels, int numSamples)
+{
+    // Snapshot each source's active flag ONCE so the count and the process/mix
+    // passes are consistent within this block — a concurrent add/removeSource
+    // flipping a flag between two reads must not change which branch runs.
+    // removeSource waits for all callback bodies to drain before releasing, so a
+    // source snapshotted active here is safe even if deactivated an instant later.
+    bool act[kMaxSources];
+    int firstActive = -1, activeCount = 0;
+    for (int i = 0; i < kMaxSources; ++i)
+    {
+        act[i] = sources[(size_t) i]->isActive()
+                 && sources[(size_t) i]->getDeviceKey() == deviceKey;
+        if (act[i]) { ++activeCount; if (firstActive < 0) firstActive = i; }
+    }
+
+    if (activeCount == 0)
+    {
+        // No source on this device → silence. An extra device with no bound source
+        // contributes nothing to the output sum. The primary always has sources[0]
+        // (deviceKey 0, active from construction), so it never reaches this branch.
+        for (int ch = 0; ch < effectiveOutputChannels; ++ch)
+            mixBuf.clear(ch, 0, numSamples);
+        return 0;
+    }
+
+    if (activeCount == 1)
+    {
+        // Fast path — exactly one source: process in place on mixBuf, byte-
+        // identical to the single-pipeline engine (channel select / mono mix +
+        // input gain, metering, ML + ring feed, gate, YIN, tone chain, monitor).
+        sources[(size_t) firstActive]
+            ->processBlock(inputData, numInputChannels, mixBuf, effectiveOutputChannels, numSamples);
+        return 1;
+    }
+
+    // Multi-source: each renders its own 2-channel monitor into monitorScratch
+    // (each builds its mono from its bound channel + feeds its own rings /
+    // detectors / verifier), summed to STEREO (0/1). A >2-channel output keeps
+    // channels 2+ silent in multi-source mode (the fast path still broadcasts).
+    for (int ch = 0; ch < effectiveOutputChannels; ++ch)
+        mixBuf.clear(ch, 0, numSamples);
+    const int mixCh = juce::jmin(effectiveOutputChannels, 2);
+    const int n = juce::jmin(numSamples, monitorScratch.getNumSamples());
+    for (int i = 0; i < kMaxSources; ++i)
+    {
+        if (! act[i]) continue;
+        sources[(size_t) i]->processBlock(inputData, numInputChannels, monitorScratch, 2, n);
+        for (int ch = 0; ch < mixCh; ++ch)
+            mixBuf.addFrom(ch, 0, monitorScratch, ch, 0, n);
+    }
+    return activeCount;
+}
+
+void AudioEngine::packStereoIntoRing(const juce::AudioBuffer<float>& buf, int numSamples,
+                                     std::array<std::atomic<uint64_t>, kOutputRingFrames>& ring,
+                                     std::atomic<uint64_t>& writeIndex)
+{
+    // Strict SPSC: the producer (one device callback) only ever writes writeIndex;
+    // the consumer (audioOutputCallback) is the sole writer of the paired
+    // readIndex. Drop-oldest = letting writeIndex lap the buffer; the consumer
+    // advances readIndex when it observes (w - r) > cap. The single packed store
+    // prevents an L/R tear when the producer wraps mid-callback (relaxed because
+    // ordering is established by the release on writeIndex below).
+    constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
+    const uint64_t w = writeIndex.load(std::memory_order_relaxed);
+    const float* L = buf.getReadPointer(0);
+    const float* R = buf.getReadPointer(1);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const uint64_t slot = (w + (uint64_t) i) & kMask;
+        ring[slot].store(packLR(L[i], R[i]), std::memory_order_relaxed);
+    }
+    writeIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
+}
+
+void AudioEngine::extraInputCallback(int slot, const float* const* inputData, int numInputChannels, int numSamples)
+{
+    if (slot < 0 || slot >= kMaxExtraInputDevices) return;
+    InputDeviceSlot& s = extraInputs[(size_t) slot];
+    if (! s.active.load(std::memory_order_acquire)) return;
+
+    callbacksInFlight[(size_t) s.deviceKey].fetch_add(1, std::memory_order_acq_rel);
+
+    // Clamp to the per-slot scratch sized in extraInputAboutToStart so the hot
+    // loop never allocates if a reconfig race delivers a larger block.
+    const int cap = s.fanScratch.getNumSamples();
+    if (numSamples > cap) numSamples = cap;
+
+    juce::AudioBuffer<float> mix;
+    mix.setDataToReferTo(s.fanScratch.getArrayOfWritePointers(), 2, numSamples);
+    mixSourcesForDevice(s.deviceKey, inputData, numInputChannels, mix, s.monitorScratch, 2, numSamples);
+    packStereoIntoRing(mix, numSamples, s.ring, s.writeIndex);
+
+    callbacksInFlight[(size_t) s.deviceKey].fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void AudioEngine::extraInputAboutToStart(int slot, juce::AudioIODevice* device)
+{
+    if (slot < 0 || slot >= kMaxExtraInputDevices || device == nullptr) return;
+    InputDeviceSlot& s = extraInputs[(size_t) slot];
+    const int bs = device->getCurrentBufferSizeSamples();
+    s.blockSize.store(bs, std::memory_order_relaxed);
+    // Prepare against this DEVICE's actual sample rate — the source of truth.
+    // bindInputDevice forces it to (and verifies it equals) the engine rate, so the
+    // verifier (which reads the engine-wide currentSampleRate) and the detectors
+    // agree. Reading the device here rather than assuming currentSampleRate keeps
+    // the prepare correct even if a future path opens it differently.
+    double sr = device->getCurrentSampleRate();
+    if (sr <= 0.0) sr = currentSampleRate.load(std::memory_order_relaxed);
+    s.sampleRate.store(sr, std::memory_order_relaxed);
+    // Size per-slot scratch generously (cold-start guard) on this device-management
+    // thread — never the RT thread.
+    const int cap = juce::jmax(bs, 2048);
+    s.fanScratch.setSize(2, cap, false, false, true);
+    s.monitorScratch.setSize(2, cap, false, false, true);
+    s.fanScratch.clear();
+    s.monitorScratch.clear();
+    s.writeIndex.store(0, std::memory_order_relaxed);
+    s.readIndex.store(0, std::memory_order_relaxed);
+    for (auto& v : s.ring) v.store(0, std::memory_order_relaxed);
+
+    // Capture-latency correction: the renderer's playhead is aligned to the PRIMARY
+    // device's input latency, but this extra device captures with a different
+    // latency, so its audio sits at a different song-time than the playhead assumes.
+    // Set its sources' verifier offset to (extra − primary) input latency so they
+    // match this device's just-captured audio against the right chart notes.
+    int extraLatSamples = device->getInputLatencyInSamples();
+    int primaryLatSamples = 0;
+    if (auto* pdev = inputDeviceManager.getCurrentAudioDevice())
+        primaryLatSamples = pdev->getInputLatencyInSamples();
+    // (extra − primary) reported input latency. On JACK/PipeWire this is 0 (no
+    // latency reported); the residual per-device offset is instead dialed in by the
+    // user via setSourceVerifierOffset (a stable auto-measure isn't possible — the
+    // value is device-specific and signal-level-confounded). 0 here = no auto shift.
+    const double deltaSec = (sr > 0.0) ? (double) (extraLatSamples - primaryLatSamples) / sr : 0.0;
+    s.latencyDeltaSec.store(deltaSec, std::memory_order_relaxed);
+
+    // Prepare each source bound to this device so its verifier/detectors run, and
+    // apply the latency correction.
+    {
+        std::lock_guard<std::mutex> lock(sourcesMutex);
+        for (auto& src : sources)
+            if (src->isActive() && src->getDeviceKey() == s.deviceKey)
+            {
+                src->prepare(sr, bs);
+                src->setVerifierAutoOffset(deltaSec);
+            }
+    }
+    s.active.store(true, std::memory_order_release);
+}
+
+void AudioEngine::extraInputStopped(int slot)
+{
+    if (slot < 0 || slot >= kMaxExtraInputDevices) return;
+    InputDeviceSlot& s = extraInputs[(size_t) slot];
+    // JUCE blocks for this slot's callback thread before firing this, so the
+    // slot's body is quiescent. Hide it from the output sum, then release ITS
+    // sources (no other callback touches them — they all filter by deviceKey).
+    s.active.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(sourcesMutex);
+        // PERMANENT unbind (the user removed this device): the slot will never
+        // re-open, so DEACTIVATE its sources too — leaving them "active" would strand
+        // pooled slots no callback can ever service (a ghost detector in listSources).
+        // A TRANSIENT close (stopAudio/reconfigure/unplug) only releases them, so
+        // startAudio()'s re-open resumes them in place. Read the atomic flag (set by
+        // the control-thread unbind) rather than the juce::String desiredDeviceName,
+        // which this device-thread path must not race on.
+        const bool permanent = s.permanentUnbind.load(std::memory_order_acquire);
+        for (auto& src : sources)
+            if (src->isActive() && src->getDeviceKey() == s.deviceKey)
+            {
+                src->releaseResources();
+                // Zero the meters so getSourceLevels() reports silence while the
+                // device is gone — otherwise the renderer's per-source silence gate
+                // treats a stopped/unplugged input as still hearing audio (the last
+                // non-zero level latches). releaseResources() doesn't touch them.
+                src->resetInputMeters();
+                if (permanent) src->setActive(false);
+            }
+        // Retry any removeSource() cleanup that was deferred waiting for callbacks to
+        // drain. With this slot's callback now stopped, callbacksInFlight may finally
+        // be 0; audioDeviceStopped() (primary) might never observe that window during
+        // multi-device playback, so reclaim here too or a pending slot can leak until
+        // the next add/remove.
+        reclaimPendingReleases();
+    }
+    s.writeIndex.store(0, std::memory_order_relaxed);
+    s.readIndex.store(0, std::memory_order_relaxed);
+}
+
+int AudioEngine::activeExtraInputCount() const
+{
+    int n = 0;
+    for (const auto& s : extraInputs)
+        if (s.active.load(std::memory_order_acquire)) ++n;
+    return n;
+}
+
+juce::String AudioEngine::bindInputDevice(int deviceKey, const juce::String& deviceName)
+{
+    if (deviceKey < 1 || deviceKey > kMaxExtraInputDevices)
+        return "deviceKey out of range";
+    const int slot = deviceKey - 1;
+    InputDeviceSlot& s = extraInputs[(size_t) slot];
+    if (s.active.load(std::memory_order_acquire))
+        return "device slot already bound";
+
+    // Reject binding the SAME physical device into a second slot. Two callbacks
+    // reading one interface is wasteful (and fails outright on exclusive drivers);
+    // multiple sources that want this device should share its one deviceKey and pick
+    // different channels instead. Checks both open + deferred (desired) slots.
+    for (int other = 0; other < kMaxExtraInputDevices; ++other)
+        if (other != slot && extraInputs[(size_t) other].desiredDeviceName == deviceName)
+            return "device already bound to another input slot";
+
+    // Reject binding the device that is the PRIMARY input — it is already "Main", and
+    // opening it on this slot's manager too would double-open one interface on two
+    // managers (fatal on exclusive backends). Critically this also guards the REOPEN
+    // path: if the user makes a bound extra device the new main input, the preserved
+    // intent must NOT resurrect it as an extra (reopenDesiredExtraInputs() then drops
+    // the now-invalid binding via its failure handling).
+    if (auto* primary = inputDeviceManager.getCurrentAudioDevice())
+        if (primary->getName() == deviceName)
+            return "device is the primary input — use Main, not an extra slot";
+
+    // An extra input device requires SPLIT mode: the output callback owns the mix +
+    // backing + gain and sums every device ring. In DUPLEX the primary device owns
+    // both directions and the output manager is closed, so we cannot just flip the
+    // flag — that would leave the output mix path absent (silent / unrouted). Reject
+    // here so the renderer reconfigures to a separate output device first. Checked
+    // BEFORE the deferred path below — startAudio()'s reopen also skips duplex, so a
+    // deferred bind in duplex would silently never come up while reporting success.
+    if (duplexMode.load(std::memory_order_relaxed))
+        return "extra input requires split mode — select a separate output device first";
+
+    // Deregister any STALE callback BEFORE touching the manager. An earlier unplanned
+    // stop (USB unplug / backend restart) leaves s.callback registered; if we opened
+    // the manager (initialise / setAudioDeviceSetup) with it still attached, JUCE
+    // could dispatch it on the default/new device mid-setup — processing the wrong
+    // hardware, or even firing extraInputAboutToStart() during a stopped-engine
+    // validation open. Idempotent no-op when not registered.
+    s.manager.removeAudioCallback(&s.callback);
+
+    // Open `deviceName` input-only on this slot's own manager. initialise first so
+    // the manager has a device type, then switch to the requested input device with
+    // all its channels (the source picks a channel within).
+    s.manager.initialiseWithDefaultDevices(2, 0);
+
+    // The device name may belong to a device TYPE (ALSA / JACK / CoreAudio / …)
+    // different from the slot manager's default — a JACK device name won't resolve
+    // under ALSA and vice-versa ("No such device"). Find the type that actually
+    // lists this input device and switch the slot manager to it. Prefer the primary
+    // manager's current type (the devices the user already sees working).
+    juce::String chosenType;
+    if (auto* pt = inputDeviceManager.getCurrentDeviceTypeObject())
+    {
+        pt->scanForDevices();
+        if (pt->getDeviceNames(true).contains(deviceName))
+            chosenType = pt->getTypeName();
+    }
+    if (chosenType.isEmpty())
+        for (auto* t : s.manager.getAvailableDeviceTypes())
         {
-            const uint64_t slot = (w + (uint64_t) i) & kMask;
-            // Single atomic store packs both channels — prevents the L/R tear
-            // a consumer could otherwise observe when the producer wraps
-            // mid-callback (relaxed because ordering is established by the
-            // release on outputRingWriteIndex below).
-            outputPendingRing[slot].store(packLR(L[i], R[i]), std::memory_order_relaxed);
+            t->scanForDevices();
+            if (t->getDeviceNames(true).contains(deviceName)) { chosenType = t->getTypeName(); break; }
         }
-        outputRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
+    // setCurrentAudioDeviceType can THROW from inside some JUCE backends (ASIO, and
+    // misconfigured JACK/CoreAudio) — setAudioDevices() guards it for the primary, so
+    // this path must too, or a bad backend terminates the process instead of
+    // returning an error to the renderer. Close the slot manager on failure.
+    if (chosenType.isNotEmpty())
+    {
+        try { s.manager.setCurrentAudioDeviceType(chosenType, true); }
+        catch (...) { s.manager.closeAudioDevice(); return "extra-input setCurrentAudioDeviceType threw"; }
+    }
+
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+    s.manager.getAudioDeviceSetup(setup);
+    setup.inputDeviceName = deviceName;
+    setup.outputDeviceName = "";
+    // Open ALL of the device's capture channels (not just the default first pair),
+    // so a source bound to channel 2+ of a multi-channel extra interface actually
+    // receives audio — mirrors the primary device's explicit full-range open.
+    int inputChannelCount = 0;
+    if (auto* t = s.manager.getCurrentDeviceTypeObject())
+    {
+        std::unique_ptr<juce::AudioIODevice> probe(t->createDevice({}, deviceName));
+        if (probe) inputChannelCount = probe->getInputChannelNames().size();
+    }
+    if (inputChannelCount <= 0) inputChannelCount = 2;
+    setup.inputChannels.setRange(0, inputChannelCount, true);
+    setup.useDefaultInputChannels = false;
+    setup.useDefaultOutputChannels = false;
+    // Force the extra device to the ENGINE's sample rate. Each SourceChain's
+    // verifier/detectors read the engine-wide currentSampleRate (bound by
+    // reference at construction), so an extra input running at a different rate
+    // (e.g. a 44.1 kHz device in a 48 kHz engine) would be scored on the wrong
+    // clock — skewing pitch/timing for every source bound to it. Matching the
+    // engine rate here (the OS/driver resamples if needed) keeps them coherent; a
+    // device that cannot do this rate fails the setup below and is rejected.
+    const double engineSr = currentSampleRate.load(std::memory_order_relaxed);
+    if (engineSr > 0.0)
+        setup.sampleRate = engineSr;
+    // initialiseWithDefaultDevices above may have opened a default capture device on
+    // this slot manager; every failure path below must close it, or a failed bind
+    // leaves the interface captured until engine teardown (fatal on exclusive
+    // backends + breaks retries / other apps).
+    juce::String err;
+    try { err = s.manager.setAudioDeviceSetup(setup, true); }
+    catch (...) { s.manager.closeAudioDevice(); return "extra-input setAudioDeviceSetup threw"; }
+    if (err.isNotEmpty())
+    {
+        s.manager.closeAudioDevice();
+        return "extra input: " + err + (chosenType.isEmpty() ? " (no type lists this device)" : " (type " + chosenType + ")");
+    }
+    auto* extraDev = s.manager.getCurrentAudioDevice();
+    if (extraDev == nullptr)
+    {
+        s.manager.closeAudioDevice();
+        return "extra input device did not open";
+    }
+
+    // Some backends accept the rate request but actually open at a different rate.
+    // Since the SourceChain verifier reads the engine-wide currentSampleRate, a
+    // mismatch would score this device on the wrong clock — reject rather than
+    // ship silently-wrong timing. (Tolerant of a sub-Hz rounding difference.)
+    if (engineSr > 0.0 && std::abs(extraDev->getCurrentSampleRate() - engineSr) > 1.0)
+    {
+        const juce::String got = juce::String(extraDev->getCurrentSampleRate());
+        s.manager.closeAudioDevice();
+        return "extra input opened at " + got + " Hz, not the engine rate " + juce::String(engineSr) + " Hz";
+    }
+
+    // The device opened + validated. Record the INTENT now (not before the fallible
+    // open above), so it drives re-open across a reconfigure without lingering after
+    // a failed attach. Clear the permanent-unbind flag: a future stop on this slot is
+    // transient (resume) until the user explicitly unbinds again.
+    s.desiredDeviceName = deviceName;
+    s.permanentUnbind.store(false, std::memory_order_release);
+
+    // If the engine is not running, we opened only to VALIDATE eagerly (so an
+    // unplugged / wrong-rate device fails the bind NOW instead of silently dropping
+    // at the next startAudio). Close it again so a stopped engine never leaves an
+    // interface capturing in the background; reopenDesiredExtraInputs() re-opens it
+    // (and re-attaches the callback) when the engine next starts.
+    if (! audioRunning.load(std::memory_order_relaxed))
+    {
+        s.manager.closeAudioDevice();
+        return {};
+    }
+
+    // Attach the callback — fires extraInputAboutToStart (prepares + flips active).
+    // Any stale registration was already removed before the open above, so this
+    // registers exactly once.
+    s.manager.addAudioCallback(&s.callback);
+    return {};
+}
+
+bool AudioEngine::unbindInputDevice(int deviceKey)
+{
+    if (deviceKey < 1 || deviceKey > kMaxExtraInputDevices)
+        return false;
+    const int slot = deviceKey - 1;
+    // User-initiated unbind: mark it PERMANENT (the device thread's extraInputStopped
+    // reads this atomic to deactivate the slot's sources) BEFORE closing, and forget
+    // the INTENT so a later startAudio() does not resurrect a device the user
+    // deliberately removed.
+    extraInputs[(size_t) slot].permanentUnbind.store(true, std::memory_order_release);
+    extraInputs[(size_t) slot].desiredDeviceName = {};
+    // If the device is open, closing it fires extraInputStopped(), which — with the
+    // intent now cleared — deactivates this deviceKey's sources. If it was ALREADY
+    // closed (e.g. a prior stopAudio() kept the intent + left the sources active for
+    // a resume that will now never come), extraInputStopped() will NOT run, so we
+    // must deactivate them here — otherwise they linger as ghost sources stranding
+    // pool slots and showing in listSources().
+    if (! closeExtraInputDevice(slot))
+    {
+        std::lock_guard<std::mutex> lock(sourcesMutex);
+        for (auto& src : sources)
+            if (src->isActive() && src->getDeviceKey() == deviceKey)
+            {
+                src->releaseResources();
+                src->setActive(false);
+            }
+    }
+    return true;
+}
+
+// Close the device open on a slot WITHOUT forgetting desiredDeviceName, so
+// startAudio() re-opens it. Used by stopAudio()/reconfigure (transient close) — the
+// public unbindInputDevice() clears the intent first (permanent removal).
+bool AudioEngine::closeExtraInputDevice(int slot)
+{
+    if (slot < 0 || slot >= kMaxExtraInputDevices)
+        return false;
+    InputDeviceSlot& s = extraInputs[(size_t) slot];
+    const bool wasActive = s.active.load(std::memory_order_acquire);
+    // Close + deregister UNCONDITIONALLY (not gated on `active`). An UNPLANNED stop
+    // (USB unplug / backend restart) fires extraInputStopped() — flipping active
+    // false — yet leaves the manager owning a (possibly auto-recovering) device and
+    // s.callback still registered. If we no-oped on !active, stopAudio()/reconfigure
+    // would never release it and the backend could resume callbacks after the engine
+    // is supposedly stopped. Both calls are idempotent when already closed/absent.
+    // For an ACTIVE slot, closeAudioDevice() blocks for the callback thread then fires
+    // audioDeviceStopped → extraInputStopped (releases this device's sources).
+    s.manager.closeAudioDevice();
+    s.manager.removeAudioCallback(&s.callback);
+    return wasActive;
+}
+
+// Re-open every slot that has a desiredDeviceName but is not currently active — the
+// post-(re)start restore of extra inputs. No-op in duplex (extras need split) and
+// when nothing is desired (the single-device path). Called from startAudio().
+void AudioEngine::reopenDesiredExtraInputs()
+{
+    if (duplexMode.load(std::memory_order_relaxed))
+    {
+        // Duplex has no consumer for extra-device rings, so the desired extras cannot
+        // open right now. PRESERVE their intent (so a later switch back to split
+        // auto-restores them — setAudioDevices() promises bindings survive a device
+        // change) and keep their sources active to resume in place; but ZERO their
+        // meters so getSourceLevels() reports silence while the device is gone (the
+        // renderer's per-source silence gate then won't treat a temporarily-unavailable
+        // source as still hearing audio, and there is no false detection). The sources
+        // are not "ghosts": split-restore reopens the device and they resume.
+        for (int dk = 1; dk <= kMaxExtraInputDevices; ++dk)
+        {
+            if (extraInputs[(size_t) (dk - 1)].desiredDeviceName.isEmpty())
+                continue;
+            std::lock_guard<std::mutex> lock(sourcesMutex);
+            for (auto& src : sources)
+                if (src->isActive() && src->getDeviceKey() == dk)
+                    src->resetInputMeters();
+        }
+        return;
+    }
+    for (int dk = 1; dk <= kMaxExtraInputDevices; ++dk)
+    {
+        InputDeviceSlot& s = extraInputs[(size_t) (dk - 1)];
+        if (s.desiredDeviceName.isEmpty() || s.active.load(std::memory_order_acquire))
+            continue;
+        const juce::String err = bindInputDevice(dk, s.desiredDeviceName);  // re-sets desired (idempotent)
+        if (err.isNotEmpty())
+        {
+            // Reopen failed — the interface was unplugged, or no longer supports the
+            // engine rate. The transient close kept this slot's sources ACTIVE to
+            // resume; since they now never will, give up cleanly: drop the intent and
+            // deactivate them so they do not linger as ghost sources stranding pool
+            // slots. The renderer re-binds + re-adds if the device returns.
+            s.desiredDeviceName = {};
+            std::lock_guard<std::mutex> lock(sourcesMutex);
+            for (auto& src : sources)
+                if (src->isActive() && src->getDeviceKey() == dk)
+                    src->setActive(false);
+        }
     }
 }
 
@@ -1952,6 +2514,36 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
             buffer.setSample(1, i, outputPullScratchR[(size_t) i]);
     }
 
+    // Phase 2: sum every active EXTRA input device's ring on top of the primary's
+    // output. Each is an independent SPSC ring fed by that device's own callback at
+    // its own hardware clock; the same drop-oldest catch-up absorbs its drift, so
+    // two separate interfaces mix cleanly with no cross-device resampling.
+    for (auto& s : extraInputs)
+    {
+        if (! s.active.load(std::memory_order_acquire)) continue;
+        uint64_t er = s.readIndex.load(std::memory_order_relaxed);
+        const uint64_t ew = s.writeIndex.load(std::memory_order_acquire);
+        if (ew < er) { er = ew; s.readIndex.store(er, std::memory_order_relaxed); }
+        if ((ew - er) > kCap)
+        {
+            er = ew - kCap;
+            s.readIndex.store(er, std::memory_order_relaxed);
+            s.overflowCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t eAvail   = ew - er;
+        const int      ePull    = juce::jmin(outSamples, (int) eAvail);
+        const int      eConsume = juce::jmin(numSamples,  (int) eAvail);
+        for (int i = 0; i < ePull; ++i)
+        {
+            const uint64_t slot = (er + (uint64_t) i) & kMask;
+            float l, rr;
+            unpackLR(s.ring[(size_t) slot].load(std::memory_order_relaxed), l, rr);
+            buffer.addSample(0, i, l);
+            if (copyChannels > 1) buffer.addSample(1, i, rr);
+        }
+        s.readIndex.store(er + (uint64_t) eConsume, std::memory_order_release);
+    }
+
     {
         const juce::ScopedTryLock sl(backingLock);
         if (sl.isLocked() && backingTransport && backingPlaying.load())
@@ -1959,8 +2551,30 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
             // Shared with the duplex path so the two callbacks can't drift.
             const int backingOut = renderBackingBlockLocked(numSamples);
             const float bVol = backingVolume.load();
+            // RMS, computed identically to the duplex path so getBackingLevel()
+            // reports the same metric regardless of which device clock is active.
+            // copyChannels is already capped at 2, so it doubles as the mix count.
+            float backingLevelSq = 0.0f;
             for (int ch = 0; ch < copyChannels; ++ch)
+            {
+                const float* const src = backingBuffer.getReadPointer(ch);
+                float sumSquares = 0.0f;
+                for (int i = 0; i < backingOut; ++i)
+                    sumSquares += src[i] * src[i];
+
+                const float channelRms = (backingOut > 0)
+                    ? std::sqrt(sumSquares / backingOut) * bVol
+                    : 0.0f;
+                backingLevelSq += channelRms * channelRms;
                 buffer.addFrom(ch, 0, backingBuffer, ch, 0, backingOut, bVol);
+            }
+            currentBackingLevel.store((copyChannels > 0)
+                ? std::sqrt(backingLevelSq / copyChannels)
+                : 0.0f);
+        }
+        else
+        {
+            currentBackingLevel.store(0.0f);
         }
     }
 
@@ -1972,327 +2586,4 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
     currentOutputLevel.store(peak);
     float prevPeak = outputPeak.load();
     if (peak > prevPeak) outputPeak.store(peak);
-}
-
-ChordScorer::Result AudioEngine::scoreChord(const ChordScorer::Request& req)
-{
-    // Fast-path when the device isn't running — the input ring is
-    // zeroed in audioDeviceStopped() (and stays at zero between init
-    // and the first device start), so any FFT we ran here would just
-    // produce an all-miss score against a silence buffer. Skip the
-    // ring snapshot + FFT and synthesize the same shape directly.
-    // Keeps a renderer that polls scoreChord during a transport stop
-    // from spending main-thread CPU on a known-no-op call.
-    if (! audioRunning.load(std::memory_order_relaxed))
-    {
-        ChordScorer::Result out{};
-        out.totalStrings = (int) req.notes.size();
-        out.results.reserve(req.notes.size());
-        for (const auto& n : req.notes)
-        {
-            ChordScorer::NoteResult r{};
-            r.string = n.string;
-            r.fret = n.fret;
-            out.results.push_back(r);
-        }
-        return out;
-    }
-
-    // When a Basic Pitch model is loaded, judge the chord against the ML
-    // detector's active-pitch set — genuine polyphonic transcription rather
-    // than the per-string energy/constraint check. Returns the identical
-    // Result shape so the N-API wrapper and the plugin need no change.
-    //
-    // `req.bypassMl` overrides this: the ML path is onset-driven and drops
-    // notes the detector never onsets, so the renderer can force the DSP
-    // band-energy scorer to verify a chart note from spectral energy alone.
-    if (! req.bypassMl && mlNoteDetector.isReady())
-        return scoreChordWithMl(req);
-
-    // Snapshot the input ring at the requested window size and forward
-    // to the scorer. The renderer never sees audio data — only the
-    // result object — which is the whole point of running the scoring
-    // here rather than over an audio-frame IPC.
-    const int numSamples = (req.numSamples > 0) ? req.numSamples : 4096;
-    auto frame = getInputFrame(numSamples);
-    // currentSampleRate is 0 between init() and the first
-    // audioDeviceAboutToStart, and can also drop to 0 after a device
-    // teardown. ChordScorer would still return a well-shaped all-miss
-    // result in that case (see its `numSamples <= 0 || sampleRate <= 0`
-    // fail-closed path), so this fallback isn't load-bearing for the
-    // result shape — but a 48 kHz floor lets the scorer actually run
-    // the FFT against whatever stale audio is still in the ring,
-    // giving the renderer a real score during the small window between
-    // device-stop and the next audioRunning=false observation.
-    // Mirrors NodeAddon::GetSampleRate's 48 kHz floor.
-    double sr = currentSampleRate.load(std::memory_order_relaxed);
-    if (! std::isfinite(sr) || sr <= 0.0) sr = 48000.0;
-    return chordScorer.scoreChord(frame.data(), (int) frame.size(), sr, req);
-}
-
-std::vector<float> AudioEngine::getInputFrame(int numSamples) const
-{
-    if (numSamples <= 0) return {};
-    if (numSamples > kInputFrameRingCapacity)
-        numSamples = kInputFrameRingCapacity;
-
-    // Acquire pairs with the audio thread's release store of the write
-    // index: every sample written into the ring before that index is
-    // visible to us here.
-    const uint64_t w = inputFrameRingWriteIndex.load(std::memory_order_acquire);
-    std::vector<float> out((size_t) numSamples, 0.0f);
-
-    // Cold-start: audio thread hasn't filled `numSamples` yet. Return
-    // what we have, zero-padded on the *left* so the most-recent
-    // samples land at the end of the buffer (the YIN/HPS algorithms
-    // expect time-aligned data).
-    if (w < (uint64_t) numSamples)
-    {
-        const size_t available = (size_t) w;
-        for (size_t i = 0; i < available; ++i)
-            out[(size_t) numSamples - available + i]
-                = inputFrameRing[i].load(std::memory_order_relaxed);
-        return out;
-    }
-
-    constexpr uint64_t kMask = (uint64_t) kInputFrameRingCapacity - 1;
-    const uint64_t start = w - (uint64_t) numSamples;
-    for (int i = 0; i < numSamples; ++i)
-        out[(size_t) i]
-            = inputFrameRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
-    return out;
-}
-
-uint64_t AudioEngine::getInputSince(uint64_t fromIndex, std::vector<float>& out) const
-{
-    out.clear();
-    // Acquire pairs with the audio thread's release store — every sample
-    // written before `w` is visible here.
-    const uint64_t w = inputFrameRingWriteIndex.load(std::memory_order_acquire);
-    if (fromIndex >= w) return w;  // nothing new
-
-    constexpr uint64_t kCap  = (uint64_t) kInputFrameRingCapacity;
-    constexpr uint64_t kMask = kCap - 1;
-
-    // If the caller fell more than a ring behind, the oldest samples were
-    // overwritten — start at the oldest still-live sample. The worker drives
-    // this every ~10 ms (~480 samples) so a kCap-sample (170 ms) gap never
-    // happens in practice; the clamp just keeps the copy in-bounds.
-    uint64_t start = fromIndex;
-    if (w - start > kCap) start = w - kCap;
-
-    const size_t n = (size_t) (w - start);
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i)
-        out[i] = inputFrameRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
-    return w;
-}
-
-void AudioEngine::pushRawAudioFrame(const float* data, int numSamples) noexcept
-{
-    // Audio thread only. Relaxed per-slot stores (a concurrent reader that laps
-    // mid-snapshot would otherwise be a data race); the release store on the
-    // write index publishes the samples to getRawAudioFrame()'s acquire load.
-    const uint64_t w = rawAudioRingWriteIndex.load(std::memory_order_relaxed);
-    constexpr uint64_t kMask = (uint64_t) kRawAudioRingCapacity - 1;
-    for (int i = 0; i < numSamples; ++i)
-        rawAudioRing[(w + (uint64_t) i) & kMask].store(data[i], std::memory_order_relaxed);
-    rawAudioRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
-}
-
-std::vector<float> AudioEngine::getRawAudioFrame(int numSamples) const
-{
-    if (numSamples <= 0) return {};
-    if (numSamples > kRawAudioRingCapacity)
-        numSamples = kRawAudioRingCapacity;
-
-    // Acquire pairs with the audio thread's release store of the write index:
-    // every sample written into the ring before that index is visible here.
-    const uint64_t w = rawAudioRingWriteIndex.load(std::memory_order_acquire);
-    std::vector<float> out((size_t) numSamples, 0.0f);
-
-    // Cold-start: audio thread hasn't filled `numSamples` yet. Return what we
-    // have, zero-padded on the left so the most-recent samples land at the end
-    // (a tuner's pitch algorithm expects time-aligned data).
-    if (w < (uint64_t) numSamples)
-    {
-        const size_t available = (size_t) w;
-        for (size_t i = 0; i < available; ++i)
-            out[(size_t) numSamples - available + i]
-                = rawAudioRing[i].load(std::memory_order_relaxed);
-        return out;
-    }
-
-    constexpr uint64_t kMask = (uint64_t) kRawAudioRingCapacity - 1;
-    const uint64_t start = w - (uint64_t) numSamples;
-    for (int i = 0; i < numSamples; ++i)
-        out[(size_t) i]
-            = rawAudioRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
-    return out;
-}
-
-// ── ML note detection ─────────────────────────────────────────────────────────
-
-namespace
-{
-juce::String midiNoteName(int midi)
-{
-    static const char* names[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-    if (midi < 0 || midi > 127) return "?";
-    return juce::String(names[midi % 12]) + juce::String(midi / 12 - 1);
-}
-} // namespace
-
-PitchDetector::Detection AudioEngine::getActiveDetection() const
-{
-    // Audio stopped — neither detector has live data. Return no detection
-    // rather than letting the YIN fallback path surface its last stale note
-    // for the whole stopped / cold-start window.
-    if (! audioRunning.load(std::memory_order_relaxed))
-        return {};
-
-    // Prefer the polyphonic ML detector's dominant pitch when a model is
-    // loaded; otherwise fall back to the YIN detector. The shape is identical
-    // so getPitchDetection's consumers can't tell which detector answered.
-    if (mlNoteDetector.isReady())
-    {
-        const auto note = mlNoteDetector.getDominantNote();
-        PitchDetector::Detection d;
-        if (note.midi >= 0)
-        {
-            d.midiNote = note.midi;
-            d.confidence = note.confidence;
-            d.frequency = 440.0f * std::pow(2.0f, (float) (note.midi - 69) / 12.0f);
-            d.cents = 0.0f;  // ML detection is discrete-pitch — no cents estimate
-            d.noteName = midiNoteName(note.midi);
-        }
-        return d;
-    }
-    return pitchDetector.getLatestDetection();
-}
-
-PitchDetector::Detection AudioEngine::getRawPitchDetection() const
-{
-    // Same stopped/cold-start guard as getActiveDetection() so a halted engine
-    // returns no detection rather than a stale note.
-    if (! audioRunning.load(std::memory_order_relaxed))
-        return {};
-
-    // Always the raw YIN result — never the ML override. The frequency is the
-    // continuous, parabolically interpolated estimate and cents is the real
-    // deviation, so a tuner can read sub-Hz sharp/flat even with a model loaded.
-    return pitchDetector.getLatestDetection();
-}
-
-ChordScorer::Result AudioEngine::scoreChordWithMl(const ChordScorer::Request& req) const
-{
-    ChordScorer::Result out{};
-    out.totalStrings = (int) req.notes.size();
-    out.results.reserve(req.notes.size());
-
-    // Standard-tuning MIDI base for this (arrangement, stringCount). nullptr
-    // for unsupported pairs — every note then fails closed, mirroring the
-    // constraint scorer's fail-closed contract.
-    const std::vector<int>* base = ChordScorer::standardMidiFor(req.arrangement, req.stringCount);
-
-    // Mirror ChordScorer's request-shape validation (ChordScorer.cpp): a
-    // tuningOffsets vector whose length doesn't match stringCount is a
-    // malformed request — fail closed (every note a miss) instead of
-    // silently substituting zero offsets, which could score real hits
-    // where the constraint scorer would have returned all-miss.
-    const bool validRequest = base != nullptr
-        && (int) req.tuningOffsets.size() == req.stringCount;
-
-    // Mirror ChordScorer exactly (ChordScorer.cpp): a malformed request, or
-    // any single out-of-range note, fails the WHOLE chord closed (all-miss) —
-    // do not score the sibling notes as hits when one note is invalid.
-    bool allValid = validRequest;
-    if (allValid)
-        for (const auto& n : req.notes)
-        {
-            if (n.string < 0 || n.string >= req.stringCount || n.fret < 0)
-            {
-                allValid = false;
-                break;
-            }
-            // Reject a request whose synthesized MIDI falls outside the valid
-            // 0..127 range — the detector can't represent it, so it must fail
-            // closed like any other malformed note, not be probed downstream.
-            const int off = req.tuningOffsets[(size_t) n.string];
-            // Sum in 64-bit: base/off/capo/fret arrive from IPC as 32-bit
-            // ints, so an int sum could overflow before the range check.
-            const long long expectedMidi =
-                (long long) (*base)[(size_t) n.string] + off + req.capo + n.fret;
-            if (expectedMidi < 0 || expectedMidi > 127)
-            {
-                allValid = false;
-                break;
-            }
-        }
-
-    if (! allValid)
-    {
-        for (const auto& n : req.notes)
-        {
-            ChordScorer::NoteResult r{};
-            r.string = n.string;
-            r.fret = n.fret;
-            r.hasCents = false;
-            out.results.push_back(r);  // r.hit defaults to false
-        }
-        out.hitStrings = 0;
-        out.score = 0.0f;
-        out.isHit = false;
-        return out;
-    }
-
-    int hits = 0;
-    for (const auto& n : req.notes)
-    {
-        ChordScorer::NoteResult r{};
-        r.string = n.string;
-        r.fret = n.fret;
-        r.hasCents = false;  // ML judges by pitch-class membership, not cents
-
-        if (validRequest && n.string >= 0
-            && n.string < (int) base->size() && n.fret >= 0)
-        {
-            // Expected MIDI exactly as ChordScorer computes it:
-            // base + per-string tuning offset + capo + fret.
-            const int off = (n.string < (int) req.tuningOffsets.size())
-                                ? req.tuningOffsets[(size_t) n.string] : 0;
-            // 64-bit sum to avoid int overflow on malformed IPC values; the
-            // value is already validated to 0..127 by the allValid pass above.
-            const int expectedMidi = (int) (
-                (long long) (*base)[(size_t) n.string] + off + req.capo + n.fret);
-
-            float conf = 0.0f;
-            bool active = mlNoteDetector.isPitchActive(expectedMidi, &conf);
-
-            // Bend / slide: the sounding pitch is moving — accept a ±2
-            // semitone window around the expected note.
-            if (! active && (n.bend || n.slide))
-            {
-                for (int d = -2; d <= 2 && ! active; ++d)
-                    if (d != 0)
-                        active = mlNoteDetector.isPitchActive(expectedMidi + d, &conf);
-            }
-            // Harmonic: the fretted fundamental is suppressed and an overtone
-            // sounds — accept the octave or octave+fifth above.
-            if (! active && n.harmonic)
-                active = mlNoteDetector.isPitchActive(expectedMidi + 12, &conf)
-                      || mlNoteDetector.isPitchActive(expectedMidi + 19, &conf);
-
-            r.hit = active;
-            r.bandEnergy = conf;  // posteriorgram confidence, 0..1 (energy proxy)
-        }
-
-        if (r.hit) ++hits;
-        out.results.push_back(r);
-    }
-
-    out.hitStrings = hits;
-    out.score = out.totalStrings > 0 ? (float) hits / (float) out.totalStrings : 0.0f;
-    out.isHit = out.totalStrings > 0 && out.score >= req.minHitRatio;
-    return out;
 }

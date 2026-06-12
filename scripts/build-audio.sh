@@ -38,6 +38,39 @@ case "$ARCH" in
         ;;
 esac
 
+# Linux: NeuralAmpModelerCore's A2 (slimmable) sources use
+# std::atomic<std::shared_ptr<...>>, a C++20 library feature that libstdc++ only
+# implements from GCC 12 on. ubuntu-22.04's default g++ is 11, where the primary
+# std::atomic template fires a "trivially copyable" static_assert and the build
+# fails. Prefer a g++ >= 12 when the default is older. No-op on macOS/Windows and
+# on hosts whose default compiler is already new enough, and respects a CXX the
+# caller already set.
+if [ "$(uname -s)" = "Linux" ] && [ -z "${CXX:-}" ]; then
+    default_major="$(g++ -dumpversion 2>/dev/null | cut -d. -f1)"
+    if [ -n "$default_major" ] && [ "$default_major" -lt 12 ] 2>/dev/null; then
+        for v in 14 13 12; do
+            if command -v "g++-$v" >/dev/null 2>&1; then
+                export CC="gcc-$v" CXX="g++-$v"
+                echo "Default g++ is $default_major (<12, lacks std::atomic<shared_ptr>); using g++-$v for the NAM A2 sources"
+                # A build/ configured earlier with the default g++ has that
+                # compiler cached in CMakeCache.txt; cmake-js would reuse it and
+                # ignore CC/CXX, so the A2 sources would still compile with the
+                # old g++ and hit the static_assert. Drop a stale cache (one that
+                # isn't already on the selected compiler) so cmake reconfigures.
+                if [ -f build/CMakeCache.txt ] && ! grep -q "CMAKE_CXX_COMPILER:.*g++-$v" build/CMakeCache.txt; then
+                    echo "Removing stale build/ (configured with a different compiler) so cmake reconfigures"
+                    rm -rf build
+                fi
+                break
+            fi
+        done
+        if [ -z "${CXX:-}" ]; then
+            echo "Warning: default g++ is $default_major (<12) and no g++-12+ was found." >&2
+            echo "         The NAM A2 sources need std::atomic<shared_ptr> (GCC 12+ libstdc++); the build will likely fail." >&2
+        fi
+    fi
+fi
+
 # Get the Electron version directly from the installed Electron package.
 # Native addons MUST be built against the exact Electron ABI that ships
 # with the app — guessing a fallback (the prior `|| echo 35.7.5`) can

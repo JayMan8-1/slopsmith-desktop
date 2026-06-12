@@ -1,7 +1,7 @@
 {
     "id": "audio_engine",
     "name": "Audio Engine",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "description": "Native audio I/O, VST hosting, amp modeling, and pitch detection",
     "bundled": true,
     "nav": {
@@ -13,5 +13,52 @@
     "script": "screen.js",
     "settings": {
         "html": "settings.html"
+    },
+    "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
+    "capabilities": {
+        "audio-input": {
+            "roles": ["provider", "observer"],
+            "operations": ["source.enumerate", "source.open", "source.close"],
+            "events": ["source-registered", "source-selected", "source-opened", "source-open-degraded", "source-closed", "permission-denied"],
+            "mode": "active",
+            "compatibility": "none",
+            "ownership": "multi-provider",
+            "safety": "sensitive",
+            "version": 1,
+            "description": "Provides native desktop audio input devices to the audio-input control plane."
+        },
+        "audio-mix": {
+            "roles": ["provider", "observer"],
+            "operations": ["fader.get-value", "fader.set-value", "route.get-current", "analyser.get-summary"],
+            "events": ["fader-value-changed", "fader-unavailable"],
+            "mode": "active",
+            "compatibility": "none",
+            "ownership": "multi-provider",
+            "safety": "safe",
+            "version": 1,
+            "description": "Provides native desktop audio route, gain, and chain state."
+        },
+        "audio-monitoring": {
+            "roles": ["provider", "observer"],
+            "operations": ["monitoring.start", "monitoring.stop", "monitoring.status"],
+            "events": ["monitoring-started", "monitoring-unavailable", "monitoring-stopped"],
+            "mode": "active",
+            "compatibility": "none",
+            "ownership": "multi-provider",
+            "safety": "sensitive",
+            "version": 1,
+            "description": "Hosts native low-latency audio monitoring for desktop builds."
+        },
+        "playback": {
+            "roles": ["observer"],
+            "kind": "lifecycle",
+            "observes": ["loading", "ready", "stopped", "ended"],
+            "mode": "active",
+            "compatibility": "shim-allowed",
+            "ownership": "observer-only",
+            "safety": "safe",
+            "version": 1,
+            "description": "Observes playback lifecycle events to rebuild tone automation and tear down native chain state without wrapping window.playSong."
+        }
     }
 }

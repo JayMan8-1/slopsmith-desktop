@@ -171,6 +171,10 @@ specifics.
 
 The audio engine is a JUCE C++ library compiled as a Node.js native addon via cmake-js. It runs headless (no GUI) and communicates with Electron via N-API.
 
+Desktop renderer integrations are being migrated from private webview globals to
+Slopsmith capability domains. See [Capability Migration Notes](docs/CAPABILITY-MIGRATION.md)
+for the playback `settingsKey` migration path used by tone mappings.
+
 ### Signal Chain
 
 ```

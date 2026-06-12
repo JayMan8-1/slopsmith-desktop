@@ -1,0 +1,197 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch.outputs.branch }}
+      date: ${{ steps.date.outputs.date }}
+
+    steps:
+      # Find the most recently created release/v* branch by sorting version
+      # strings. Falls back to main if no release branch exists (quiet window
+      # between a release shipping and the next branch being cut).
+      - name: Find active release branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh api "repos/${{ github.repository }}/git/matching-refs/heads/release/v" \
+            --jq '[.[].ref | ltrimstr("refs/heads/")] | sort | last // empty' 2>/dev/null || echo "")
+          if [[ -z "$branch" ]]; then
+            branch="main"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "Active branch: $branch"
+
+      - name: Get date
+        id: date
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+  build-core:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Clone core at active branch
+        run: |
+          git clone --depth 1 --branch "${{ needs.setup.outputs.branch }}" \
+            https://github.com/slopsmith/slopsmith.git core
+          echo "Cloned slopsmith @ $(git -C core rev-parse --short HEAD) (${{ needs.setup.outputs.branch }})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: core
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/slopsmith/slopsmith:nightly
+            ghcr.io/slopsmith/slopsmith:nightly-${{ needs.setup.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - os: macos-14
+            platform: mac
+            arch: arm64
+          - os: windows-latest
+            platform: win
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.branch }}
+          submodules: recursive
+
+      - name: Read build configuration
+        id: config
+        shell: bash
+        run: |
+          NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
+          PYTHON_VERSION=$(node -p "require('./.build-config.json').versions.python")
+          echo "node=$NODE_VERSION" >> $GITHUB_OUTPUT
+          echo "python=$PYTHON_VERSION" >> $GITHUB_OUTPUT
+          echo "Node ${NODE_VERSION}, Python ${PYTHON_VERSION}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.config.outputs.python }}
+
+      # macOS: import signing cert so build-macos.sh can codesign the .app.
+      # The nightly .app is signed but not notarized — testers clear Gatekeeper with
+      #   xattr -dr com.apple.quarantine Slopsmith.app
+      # Same graceful fallback as release.yml: no-op when secrets are absent.
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'mac'
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_CERTIFICATE_P12_BASE64:-}" ]]; then
+              echo "APPLE_CERTIFICATE_P12_BASE64 not set — skipping (unsigned build)"
+              exit 0
+          fi
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security list-keychains -d user -s build.keychain login.keychain-db
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain \
+              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: \
+              -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning build.keychain | grep -q "Developer ID Application"
+
+      - name: Build
+        run: ./scripts/build-release.sh
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # No notarization for nightlies — testers use xattr -dr com.apple.quarantine
+          CSC_FOR_PULL_REQUEST: "true"
+
+      - name: Setup upterm session
+        uses: owenthereal/action-upterm@v1
+        if: ${{ failure() }}
+        with:
+          wait-timeout-minutes: 5
+
+      # macOS: zip the .app for tester distribution (same as release.yml non-tag path).
+      - name: Zip macOS app
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls -d release/mac*/Slopsmith.app 2>/dev/null | head -n1 || true)
+          if [[ -z "${app:-}" || ! -d "$app" ]]; then
+            echo "::error::No Slopsmith.app found under release/mac*/"
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-arm64.zip"
+          echo "Zipped $app -> release/Slopsmith-macos-arm64.zip"
+
+      # Windows: electron-builder's `dir` target leaves win-unpacked/ with no
+      # packaged installer (Velopack is skipped for nightlies). Zip the directory
+      # so testers can download and extract, then launch Slopsmith.exe directly.
+      - name: Zip win-unpacked
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path release\win-unpacked\* -DestinationPath release\Slopsmith-windows-x64.zip
+          Write-Host "Zipped win-unpacked -> release\Slopsmith-windows-x64.zip"
+
+      - name: Clean up signing keychain
+        if: always() && matrix.platform == 'mac'
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true
+
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ needs.setup.outputs.date }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.zip
+            build/Release/*.pdb
+          if-no-files-found: warn
+          retention-days: 7

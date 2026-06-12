@@ -11,7 +11,18 @@ on:
   # Note: workflow_dispatch only allows selecting branches that exist in
   # this repository; it cannot target branches from contributor forks.
   # For fork PRs, the maintainer must merge to a local branch first.
+  #
+  # The slopsmith_ref input selects which slopsmith *core* ref to bundle.
+  # It defaults to `main` (matching the historical behaviour), but for a
+  # coherent release build the desktop release/vX.Y.Z branch should be
+  # built against the matching core branch — e.g. run this workflow on
+  # release/v0.3.0 with slopsmith_ref=release/v0.3.0.
   workflow_dispatch:
+    inputs:
+      slopsmith_ref:
+        description: "Slopsmith core ref (branch or tag) to bundle, e.g. release/v0.3.0. Defaults to main."
+        required: false
+        default: main
 
 jobs:
   build:
@@ -130,6 +141,12 @@ jobs:
         run: ./scripts/build-release.sh
         shell: bash
         env:
+          # Which slopsmith core ref to clone + bundle. Empty on push/tag
+          # events (the inputs context only carries values on
+          # workflow_dispatch), so fall back to main — preserving the
+          # historical default-branch behaviour. clone_slopsmith() in
+          # build-common.sh also defaults to main as a second safety net.
+          SLOPSMITH_REF: ${{ inputs.slopsmith_ref || 'main' }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}

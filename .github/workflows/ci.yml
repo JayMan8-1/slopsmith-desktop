@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ['release/**']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read build configuration
+        id: config
+        shell: bash
+        run: |
+          NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
+          echo "node=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.config.outputs.node }}
+
+      # No package-lock.json in this repo — npm ci is not available.
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: TypeScript type check
+        run: npm run typecheck
+
+      - name: npm audit
+        run: npm audit --audit-level=high
+        continue-on-error: true

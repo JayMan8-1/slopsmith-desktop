@@ -6,6 +6,7 @@ set(AUDIO_SOURCES
     NoiseGate.cpp
     TonePolish.cpp
     AudioEngine.cpp
+    SourceChain.cpp
     SignalChain.cpp
     VSTHost.cpp
     NAMProcessor.cpp
@@ -186,8 +187,10 @@ endif()
 
 # NAM support
 if(NAM_AVAILABLE)
-    # Include NAM core sources directly
-    file(GLOB NAM_SOURCES "${NAM_DIR}/NAM/*.cpp")
+    # Include NAM core sources directly. GLOB_RECURSE so the A2 architecture
+    # sources under NAM/wavenet/ (added in NeuralAmpModelerCore v0.5.x) are
+    # picked up, not just the flat NAM/*.cpp files.
+    file(GLOB_RECURSE NAM_SOURCES "${NAM_DIR}/NAM/*.cpp")
     target_sources(slopsmith_audio PRIVATE ${NAM_SOURCES})
     target_include_directories(slopsmith_audio PRIVATE
         "${NAM_DIR}"
@@ -195,7 +198,14 @@ if(NAM_AVAILABLE)
         "${NAM_DIR}/Dependencies/nlohmann"
         "${NAM_DIR}/Dependencies/AudioDSPTools"
     )
-    target_compile_definitions(slopsmith_audio PRIVATE SLOPSMITH_NAM_SUPPORT=1)
+    # SLOPSMITH_NAM_SUPPORT gates our NAMProcessor; NAM_ENABLE_A2_FAST enables
+    # the hand-optimized A2 fast-path WaveNet (a2_fast.cpp / model.cpp are fully
+    # #if-guarded on it). Upstream defaults this ON; we compile NAM sources
+    # directly (no add_subdirectory) so we must set the define ourselves.
+    target_compile_definitions(slopsmith_audio PRIVATE
+        SLOPSMITH_NAM_SUPPORT=1
+        NAM_ENABLE_A2_FAST
+    )
 
     if(RTNEURAL_AVAILABLE)
         target_link_libraries(slopsmith_audio PRIVATE RTNeural)

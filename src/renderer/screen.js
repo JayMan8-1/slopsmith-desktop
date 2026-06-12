@@ -267,6 +267,150 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         return value !== undefined && value !== null && value !== '';
     }
 
+    function safeKeyPart(value) {
+        return String(value || 'default')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'default';
+    }
+
+    function currentAudioDeviceSnapshot() {
+        return {
+            inputType: deviceTypeSelect?.value || '',
+            inputDevice: inputDeviceSelect?.value || '',
+            outputType: outputDeviceTypeSelect?.value || deviceTypeSelect?.value || '',
+            outputDevice: outputDeviceSelect?.value || '',
+            sampleRate: parseFloat(sampleRateSelect?.value || '48000'),
+            bufferSize: parseInt(bufferSizeSelect?.value || '256', 10),
+        };
+    }
+
+    async function audioInputOpenHandler(request) {
+        const source = (request && request.logicalSourceKey) ? String(request.logicalSourceKey) : '';
+        const match = /^desktop-audio:([^:]+):input:(\d+)$/.exec(source);
+        const inputType = match ? match[1] : safeKeyPart(deviceTypeSelect?.value || 'default');
+        const inputIndex = match ? Number(match[2]) : -1;
+        const typeInfo = currentDeviceTypes.find(t => safeKeyPart(t && t.name) === inputType)
+            || currentDeviceTypes.find(t => t && t.name === deviceTypeSelect?.value)
+            || currentDeviceTypes[0]
+            || null;
+        const inputDevice = inputIndex >= 0 && typeInfo && Array.isArray(typeInfo.inputs)
+            ? (typeInfo.inputs[inputIndex] || '')
+            : (inputDeviceSelect?.value || '');
+        const snapshot = currentAudioDeviceSnapshot();
+        const result = await api.setDevice({
+            inputType: typeInfo && typeInfo.name ? typeInfo.name : snapshot.inputType,
+            inputDevice,
+            outputType: snapshot.outputType || (typeInfo && typeInfo.name) || snapshot.inputType,
+            outputDevice: snapshot.outputDevice,
+            sampleRate: snapshot.sampleRate,
+            bufferSize: snapshot.bufferSize,
+        });
+        const ok = typeof result === 'boolean' ? result : !!result?.ok;
+        if (!ok) return { outcome: 'failed', status: 'failed', reason: result && result.error ? String(result.error) : 'Native audio device open failed' };
+        if (typeof api.startAudio === 'function') await api.startAudio();
+        return { outcome: 'handled', status: 'open' };
+    }
+
+    async function audioInputCloseHandler() {
+        return { outcome: 'handled', status: 'closed' };
+    }
+
+    function registerAudioSessionInputSources() {
+        const audioSession = window.slopsmith && window.slopsmith.audioSession;
+        if (!audioSession || typeof audioSession.registerInputSource !== 'function') return;
+        const typeList = Array.isArray(currentDeviceTypes) ? currentDeviceTypes : [];
+        typeList.forEach((typeInfo) => {
+            const typeName = typeInfo && typeInfo.name ? String(typeInfo.name) : '';
+            const inputs = Array.isArray(typeInfo && typeInfo.inputs) ? typeInfo.inputs : [];
+            inputs.forEach((_deviceName, index) => {
+                const logicalSourceKey = `desktop-audio:${safeKeyPart(typeName)}:input:${index}`;
+                audioSession.registerInputSource({
+                    sourceId: `audio_engine:${logicalSourceKey}`,
+                    logicalSourceKey,
+                    providerId: 'audio_engine',
+                    ownerPluginId: 'audio_engine',
+                    kind: 'instrument',
+                    labelPseudonym: `Desktop input ${index + 1}`,
+                    labelSafe: true,
+                    availability: 'available',
+                    sourceMode: 'native',
+                    channelSummary: { channelCount: 2, channelShape: 'stereo', supports: ['mono', 'stereo'] },
+                    operations: ['source.open', 'source.close'],
+                    operationHandlers: {
+                        'source.open': audioInputOpenHandler,
+                        'source.close': audioInputCloseHandler,
+                    },
+                });
+            });
+        });
+        if (typeof audioSession.recordBridgeHit === 'function') {
+            audioSession.recordBridgeHit({
+                domain: 'audio-input',
+                bridgeId: 'audio-input.legacy-source',
+                legacySurface: 'window.slopsmithDesktop.audio',
+                participantId: 'audio_engine',
+                logicalSourceKey: currentAudioDeviceSnapshot().inputDevice ? 'desktop-audio:selected-input' : '',
+                outcome: 'handled',
+                status: 'native-provider',
+            });
+        }
+    }
+
+    function currentGainDb(which) {
+        const slider = which === 'input' ? inputGainSlider : outputGainSlider;
+        const value = Number(slider && slider.value);
+        return Number.isFinite(value) ? Math.min(GAIN_SLIDER_DB_MAX, Math.max(GAIN_SLIDER_DB_MIN, value)) : 0;
+    }
+
+    function applyGainDb(which, db) {
+        const clamped = Math.min(GAIN_SLIDER_DB_MAX, Math.max(GAIN_SLIDER_DB_MIN, Number(db)));
+        const committed = Number.isFinite(clamped) ? parseFloat(clamped.toFixed(1)) : 0;
+        const slider = which === 'input' ? inputGainSlider : outputGainSlider;
+        const label = which === 'input' ? inputGainLabel : outputGainLabel;
+        const engineTarget = which === 'input' ? 'input' : 'chain';
+        if (slider) slider.value = committed;
+        if (label) label.textContent = formatGainDbLabel(committed);
+        api.setGain(engineTarget, dbToLinearGain(committed));
+        return committed;
+    }
+
+    function registerAudioSessionMixParticipants() {
+        const audioSession = window.slopsmith && window.slopsmith.audioSession;
+        if (!audioSession || typeof audioSession.registerMixParticipant !== 'function') return;
+        const entries = [
+            { which: 'input', participantId: 'audio_engine.input_gain', label: 'Desktop Input', faderId: 'input-gain' },
+            { which: 'chain', participantId: 'audio_engine.chain_gain', label: 'Desktop Chain', faderId: 'chain-gain' },
+        ];
+        for (const entry of entries) {
+            audioSession.registerMixParticipant({
+                participantId: entry.participantId,
+                ownerPluginId: 'audio_engine',
+                label: entry.label,
+                kind: 'plugin',
+                sourceMode: 'native',
+                logicalFaderKey: `desktop-audio:${entry.faderId}`,
+                operations: ['fader.get-value', 'fader.set-value'],
+                availability: 'available',
+                fader: {
+                    id: entry.faderId,
+                    label: entry.label,
+                    unit: 'dB',
+                    min: GAIN_SLIDER_DB_MIN,
+                    max: GAIN_SLIDER_DB_MAX,
+                    step: 0.1,
+                    defaultValue: 0,
+                    currentValue: currentGainDb(entry.which),
+                },
+                operationHandlers: {
+                    'fader.get-value': () => currentGainDb(entry.which),
+                    'fader.set-value': (value) => ({ committedValue: applyGainDb(entry.which, value) }),
+                },
+                version: 1,
+            });
+        }
+    }
+
     function selectHasValue(select, value) {
         if (!select) return false;
         const s = String(value);
@@ -837,6 +981,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
 
         await refreshDeviceOptions();
+        registerAudioSessionInputSources();
+        registerAudioSessionMixParticipants();
     }
 
     function updateInputDeviceDropdown(typeInfo) {
@@ -1038,6 +1184,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 if (!outputDeviceTypeSelect) updateOutputDeviceDropdown(typeInfo);
             }
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         if (outputDeviceTypeSelect) {
@@ -1045,15 +1192,18 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 const typeInfo = currentDeviceTypes.find(t => t.name === outputDeviceTypeSelect.value);
                 if (typeInfo) updateOutputDeviceDropdown(typeInfo);
                 await refreshDeviceOptions();
+                registerAudioSessionInputSources();
             });
         }
 
         inputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         outputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         sampleRateSelect.addEventListener('change', () => {
@@ -1133,6 +1283,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             const db = parseFloat(inputGainSlider.value);
             api.setGain('input', dbToLinearGain(db));
             inputGainLabel.textContent = formatGainDbLabel(db);
+            registerAudioSessionMixParticipants();
         });
 
         outputGainSlider.addEventListener('input', () => {
@@ -1140,6 +1291,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             // 'chain' = guitar-only amp output (see applyPresetGainLevels).
             api.setGain('chain', dbToLinearGain(db));
             outputGainLabel.textContent = formatGainDbLabel(db);
+            registerAudioSessionMixParticipants();
         });
 
         if (noiseGateEnable) {
@@ -1888,6 +2040,11 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
      *  preload would treat the preserved chain as already cleared. */
     async function clearChainForNewSong() {
         if (!api?.clearChain) return false;
+        const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
+        if (providerChainActive) {
+            console.log('[audio-engine] Provider-managed audio-effects chain active — keeping current chain');
+            return false;
+        }
         // Don't wipe a hand-built chain when the song has no tone-switching to
         // replace it with — that would silence the guitar (empty chain + monitor mute).
         if (!songShouldRebuildChain()) {
@@ -1984,6 +2141,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     let toneSwitcher = null;
     let autoSwitchEnabled = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
     const originalToneNamesCache = new Map();
+    let midiAmpSongTonesUnavailable = false;
+    const midiAmpSongTonesPending = new Map();
 
     class ToneSwitcher {
         constructor() {
@@ -2122,6 +2281,179 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         return { ...all.global, ...songMappings };
     }
 
+    const AUDIO_EFFECTS_PROVIDER_LABELS = {
+        'rig_builder.effects': 'Rig Builder',
+        'rig-builder': 'Rig Builder',
+        'nam-tone': 'NAM Tone',
+    };
+
+    function audioEffectsProviderId(row) {
+        return String(row?.provider_id || row?.providerId || '').trim();
+    }
+
+    function audioEffectsProviderLabel(providerId) {
+        const id = String(providerId || '').trim();
+        if (!id) return 'Audio Effects Provider';
+        return AUDIO_EFFECTS_PROVIDER_LABELS[id] || id.replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    async function fetchAudioEffectMappingsForSong(songKey) {
+        const key = normalizeSongKey(songKey);
+        const filename = normalizeSongKey(window._currentSongFile || window.__rbPlaybackSettingsFilename);
+        if (!key && !filename) return [];
+        const params = new URLSearchParams();
+        if (key) params.set('song_key', key);
+        if (filename && filename !== key) params.set('filename', filename);
+        try {
+            const resp = await fetch(`/api/audio-effects/mappings?${params.toString()}`);
+            if (!resp.ok) return [];
+            const data = await resp.json().catch(() => ({}));
+            return Array.isArray(data?.mappings) ? data.mappings : [];
+        } catch (e) {
+            console.warn('[audio-engine] audio-effects mappings read failed:', e);
+            return [];
+        }
+    }
+
+    function activeProviderManagedMappings(rows) {
+        return (Array.isArray(rows) ? rows : [])
+            .filter(row => row && row.active && audioEffectsProviderId(row));
+    }
+
+    function summarizeProviderManagedMappings(rows) {
+        const active = activeProviderManagedMappings(rows);
+        if (active.length === 0) return null;
+        const providerId = audioEffectsProviderId(active.find(row => audioEffectsProviderId(row) === 'rig_builder.effects') || active[0]);
+        const providerRows = active.filter(row => audioEffectsProviderId(row) === providerId);
+        return {
+            providerId,
+            providerLabel: audioEffectsProviderLabel(providerId),
+            rows: providerRows,
+            toneCount: new Set(providerRows.map(row => String(row?.tone_key || row?.toneKey || '').trim()).filter(Boolean)).size,
+        };
+    }
+
+    function rigBuilderToneOwnershipState() {
+        const rb = window.RbMegaChain;
+        let state = null;
+        try {
+            if (rb && typeof rb.state === 'function') state = rb.state();
+        } catch (_) { state = null; }
+        const active = !!(state?.active || (rb && typeof rb.isActive === 'function' && rb.isActive()));
+        const pending = !!(state?.pending || (rb && typeof rb.isPending === 'function' && rb.isPending()));
+        const failed = !!state?.failed;
+        const enabled = !!(state?.enabled || window.__rbMegaChainSetting === true || (rb && typeof rb.settingOn === 'function' && rb.settingOn()));
+        if (!active && !pending && !failed && !enabled) return null;
+        return {
+            active,
+            pending,
+            failed,
+            enabled,
+            state: pending ? 'selected' : failed ? 'fallback' : active ? 'loaded' : 'selected',
+        };
+    }
+
+    function inspectProviderManagedAudioEffectsRoute() {
+        const api = window.slopsmith?.audioEffects;
+        const rigBuilderOwner = rigBuilderToneOwnershipState();
+        const rigBuilderManaged = !!rigBuilderOwner;
+        const rigBuilderState = rigBuilderOwner?.state || 'selected';
+        if (!api || typeof api.inspectRoute !== 'function') {
+            return rigBuilderManaged ? { route: { state: rigBuilderState }, provider: null, providerId: 'rig_builder.effects', state: rigBuilderState } : null;
+        }
+        let route = null;
+        let provider = null;
+        try {
+            const result = api.inspectRoute({ routeKey: 'desktop-main' });
+            route = result && result.payload && result.payload.route;
+            provider = result && result.payload && result.payload.provider;
+        } catch (_) {
+            route = null;
+            provider = null;
+        }
+        const providerId = String(route?.providerId || provider?.providerId || '').trim();
+        const state = String(route?.state || '').trim();
+        if ((!providerId || providerId === 'nam-tone') && rigBuilderManaged) {
+            return { route: route || { state: rigBuilderState }, provider, providerId: 'rig_builder.effects', state: rigBuilderState };
+        }
+        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolving', 'resolved', 'loaded', 'degraded', 'loading', 'fallback'].includes(state)) return null;
+        return { route, provider, providerId, state };
+    }
+
+    window._aeInspectProviderManagedChain = inspectProviderManagedAudioEffectsRoute;
+
+    function summarizeActiveProviderManagedRoute() {
+        const inspected = inspectProviderManagedAudioEffectsRoute();
+        if (!inspected) return null;
+        const route = inspected.route || {};
+        const planSummary = route.planSummary || {};
+        const stageCount = Number(planSummary.stageCount || 0);
+        let label = inspected.state;
+        if (inspected.state === 'fallback') label = 'Chain failed';
+        else if (inspected.state === 'degraded') label = 'Chain degraded';
+        else if (['selected', 'resolving', 'loading'].includes(inspected.state)) label = 'Loading chain';
+        else if (stageCount > 0) label = `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}`;
+        return {
+            providerId: inspected.providerId,
+            providerLabel: String(inspected.provider?.label || '').trim() || audioEffectsProviderLabel(inspected.providerId),
+            rows: [{ tone_key: route.activeSegmentId || 'Active chain', label }],
+            toneCount: 1,
+            routeManaged: true,
+        };
+    }
+
+    function hasProviderManagedAudioEffectsChain() {
+        return !!inspectProviderManagedAudioEffectsRoute();
+    }
+
+    window._aeHasProviderManagedChain = hasProviderManagedAudioEffectsChain;
+
+    function shouldShowPlayerChainButton() {
+        const inspected = inspectProviderManagedAudioEffectsRoute();
+        return String(inspected?.providerId || '').trim() === 'nam-tone';
+    }
+
+    window._aeShouldShowPlayerChainButton = shouldShowPlayerChainButton;
+
+    function cloneToneMappingBucket(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function isEmptyToneMappingBucket(value) {
+        return !value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length === 0;
+    }
+
+    function migrateToneMappingsToPlaybackSettingsKey(settingsKey, legacySongKey) {
+        const newKey = normalizeSongKey(settingsKey);
+        const oldKey = normalizeSongKey(legacySongKey);
+        if (!newKey || !oldKey || newKey === oldKey) return false;
+
+        const all = readToneMappingsStore();
+        let migrated = false;
+        const migrateBucket = (section) => {
+            const src = cloneToneMappingBucket(all[section]?.[oldKey]);
+            if (!src || !isEmptyToneMappingBucket(all[section]?.[newKey])) return;
+            all[section][newKey] = src;
+            migrated = true;
+        };
+
+        migrateBucket('songs');
+        migrateBucket('midiPC');
+        if (!migrated) return false;
+
+        try {
+            localStorage.setItem('slopsmith-tone-mappings', JSON.stringify(all));
+            window._toneMappingsDirty = true;
+            console.log('[tone-switcher] Migrated tone mappings to playback settings key:', oldKey, '→', newKey);
+            return true;
+        } catch (e) {
+            console.warn('[tone-switcher] Failed to persist migrated tone mappings:', e);
+            return false;
+        }
+    }
+    window._aeMigrateToneMappingsToPlaybackSettingsKey = migrateToneMappingsToPlaybackSettingsKey;
+
     function saveToneMappings(songKey, mappings) {
         const all = readToneMappingsStore();
         if (songKey) {
@@ -2151,6 +2483,11 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
 
     function getCurrentSongKey() {
+        const playbackKey = normalizeSongKey(window._slopsmithPlaybackSettingsKey);
+        if (playbackKey) {
+            window._slopsmithSongKey = playbackKey;
+            return playbackKey;
+        }
         const current = normalizeSongKey(window._currentSongFile);
         if (current) {
             window._slopsmithSongKey = current;
@@ -2203,22 +2540,45 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._aeGetCurrentSongKey = getCurrentSongKey;
     window._aeGetToneChangeTime = getToneChangeTime;
 
+    function hasMidiAmpSongTonesEndpoint() {
+        if (midiAmpSongTonesUnavailable) return false;
+        return !!document.querySelector('[data-plugin-id="midi_amp"]');
+    }
+
+    async function fetchMidiAmpSongTones(key) {
+        if (!key || !hasMidiAmpSongTonesEndpoint()) return [];
+        if (midiAmpSongTonesPending.has(key)) return midiAmpSongTonesPending.get(key);
+        const pending = (async () => {
+        try {
+            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
+            if (resp.status === 404) {
+                midiAmpSongTonesUnavailable = true;
+                return [];
+            }
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            return Array.isArray(data?.tones) ? data.tones : [];
+        } catch (_) {
+            return [];
+        }
+        })();
+        midiAmpSongTonesPending.set(key, pending);
+        try {
+            return await pending;
+        } finally {
+            midiAmpSongTonesPending.delete(key);
+        }
+    }
+
     async function getOriginalToneNamesForCurrentArrangement(songKey) {
         const key = normalizeSongKey(songKey);
         if (!key) return [];
-        try {
-            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
-            if (!resp.ok) return [];
-            const data = await resp.json();
-            const tones = Array.isArray(data?.tones) ? data.tones : [];
-            const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
-            const filtered = arr
-                ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
-                : tones;
-            return Array.from(new Set(filtered.map(t => (t?.name || t?.key || '').trim()).filter(Boolean)));
-        } catch (e) {
-            return [];
-        }
+        const tones = await fetchMidiAmpSongTones(key);
+        const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
+        const filtered = arr
+            ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
+            : tones;
+        return Array.from(new Set(filtered.map(t => (t?.name || t?.key || '').trim()).filter(Boolean)));
     }
 
     function getCurrentArrangementName() {
@@ -2232,10 +2592,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const cacheKey = `${key}::${arr}::v2`;
         if (originalToneNamesCache.has(cacheKey)) return originalToneNamesCache.get(cacheKey);
         try {
-            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
-            if (!resp.ok) return [];
-            const data = await resp.json();
-            const tones = Array.isArray(data?.tones) ? data.tones : [];
+            const tones = await fetchMidiAmpSongTones(key);
             const filtered = arr
                 ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
                 : tones;
@@ -2438,8 +2795,18 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
 
     // ── Floating Tone Panel in Player ──────────────────────────────────────────
+    function removePlayerChainButton() {
+        const existing = document.getElementById('btn-chain-switch');
+        if (existing) existing.remove();
+        closeTonePanel();
+    }
+
     function injectPlayerToneButton() {
         const controls = document.getElementById('player-controls');
+        if (!shouldShowPlayerChainButton()) {
+            removePlayerChainButton();
+            return;
+        }
         if (!controls || document.getElementById('btn-chain-switch')) return;
 
         // Add button before the close button
@@ -2459,6 +2826,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
     }
+    window._aeInjectPlayerToneButton = injectPlayerToneButton;
 
     window._toggleChainPanel = toggleTonePanel;
     function closeTonePanel() {
@@ -2479,6 +2847,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._refreshChainPanel = refreshTonePanelIfOpen;
 
     async function toggleTonePanel() {
+        if (!shouldShowPlayerChainButton()) {
+            removePlayerChainButton();
+            return;
+        }
         let panel = document.getElementById('ae-tone-panel-float');
         if (panel) { closeTonePanel(); return; }
 
@@ -2503,6 +2875,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         let presetNames = [];
         let songKey = '';
         let mappings = {};
+        let providerManaged = null;
         let midiConfig = null;
         let isMidiMode = false;
         const toneNamesOrdered = [];
@@ -2540,6 +2913,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 console.warn('[audio-engine] tone mappings JSON invalid:', e);
                 mappings = {};
             }
+            providerManaged = summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey)) || summarizeActiveProviderManagedRoute();
             try {
                 midiConfig = getMidiPCConfig(songKey);
             } catch (e) {
@@ -2587,8 +2961,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // thread synchronously (timers then never run).
         const midiMappings = midiConfig?.mappings || {};
         const taCfg = readTaStore();
-        /** Which switching UI is active: automation wins over MIDI when enabled in settings. */
-        const panelMode = taCfg.enabled ? 'automation' : (isMidiMode ? 'midi' : 'bypass');
+        /** Which switching UI is active: provider-managed chains win over legacy local mappings. */
+        const panelMode = providerManaged ? 'provider' : (taCfg.enabled ? 'automation' : (isMidiMode ? 'midi' : 'bypass'));
 
         let html = `<div class="flex items-center justify-between mb-3">
             <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
@@ -2601,17 +2975,37 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             for (const n of originalNames) addToneUnique(n);
         }
 
-        // Mode selector — Preset Switch | MIDI PC | Tone Automation (keyword routing from settings)
-        html += `<div class="flex items-center gap-2 mb-3">
-            <label class="text-xs text-slate-400">Mode:</label>
-            <select id="ae-tone-mode" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                <option value="bypass" ${panelMode === 'bypass' ? 'selected' : ''}>Preset Switch</option>
-                <option value="midi" ${panelMode === 'midi' ? 'selected' : ''}>MIDI Program Change</option>
-                <option value="automation" ${panelMode === 'automation' ? 'selected' : ''}>Tone Automation</option>
-            </select>
-        </div>`;
+        if (providerManaged) {
+            html += `<div id="ae-provider-mode" class="mb-3">
+                <div class="border-l-2 border-emerald-400 pl-3 mb-3">
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">Chain Provider</div>
+                    <div class="text-sm font-semibold text-slate-200">${escHtml(providerManaged.providerLabel)}</div>
+                    <div class="text-[11px] text-slate-500">${providerManaged.toneCount || providerManaged.rows.length} mapped tone${(providerManaged.toneCount || providerManaged.rows.length) === 1 ? '' : 's'} for this song</div>
+                </div>
+                <div class="space-y-1 mb-3">${providerManaged.rows.map(row => {
+                    const tone = String(row?.tone_key || row?.toneKey || '').trim() || 'Song default';
+                    const rawLabel = String(row?.label || '').trim();
+                    const label = providerManaged.providerId === 'rig_builder.effects' ? 'Full chain' : (rawLabel || providerManaged.providerLabel);
+                    return `<div class="flex items-center gap-2 text-xs">
+                        <span class="text-slate-400 w-24 truncate" title="${escHtml(tone)}">${escHtml(tone)}</span>
+                        <span class="flex-1 text-emerald-300 truncate" title="${escHtml(label)}">${escHtml(label)}</span>
+                    </div>`;
+                }).join('')}</div>
+                ${providerManaged.providerId === 'rig_builder.effects' ? '<button type="button" id="ae-open-rig-builder" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Open Rig Builder</button>' : ''}
+            </div>`;
+        } else {
+            // Mode selector — Preset Switch | MIDI PC | Tone Automation (keyword routing from settings)
+            html += `<div class="flex items-center gap-2 mb-3">
+                <label class="text-xs text-slate-400">Mode:</label>
+                <select id="ae-tone-mode" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                    <option value="bypass" ${panelMode === 'bypass' ? 'selected' : ''}>Preset Switch</option>
+                    <option value="midi" ${panelMode === 'midi' ? 'selected' : ''}>MIDI Program Change</option>
+                    <option value="automation" ${panelMode === 'automation' ? 'selected' : ''}>Tone Automation</option>
+                </select>
+            </div>`;
+        }
 
-        if (toneNamesOrdered.length > 0) {
+        if (!providerManaged && toneNamesOrdered.length > 0) {
 
             // Bypass mode — manual preset mapping per tone name
             html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}">`;
@@ -2677,7 +3071,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             html += '</div>';
             html += `<button id="ae-midi-save" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Save MIDI Mapping</button>`;
             html += '</div>';
-        } else {
+        } else if (!providerManaged) {
             // Keep mode-section ids so the Mode dropdown can show/hide bodies even
             // when this arrangement exposes no tone rows yet.
             html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tone information found for this song.</p></div>`;
@@ -2685,10 +3079,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             html += `<div id="ae-midi-mode" class="${panelMode === 'midi' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tones to assign MIDI program numbers.</p></div>`;
         }
 
-        html += `<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer mb-2 mt-2">
-            <input type="checkbox" class="accent-blue-500" id="ae-float-auto-switch" ${autoSwitchEnabled ? 'checked' : ''}>
-            Auto-switch during playback
-        </label>`;
+        if (!providerManaged) {
+            html += `<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer mb-2 mt-2">
+                <input type="checkbox" class="accent-blue-500" id="ae-float-auto-switch" ${autoSwitchEnabled ? 'checked' : ''}>
+                Auto-switch during playback
+            </label>`;
+        }
         html += `<div class="mt-3 pt-2 border-t border-slate-700/60">
             <div class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">Active Indicator</div>
             <div class="text-xs text-slate-300 font-medium min-h-[1rem]" id="ae-active-tone">Active: —</div>
@@ -2752,6 +3148,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         };
         updateActiveToneLabel();
         panel._aeActiveToneInterval = setInterval(updateActiveToneLabel, 200);
+
+        const openRigBuilder = panel.querySelector('#ae-open-rig-builder');
+        if (openRigBuilder) {
+            openRigBuilder.addEventListener('click', () => {
+                window._closeChainPanel && window._closeChainPanel();
+                if (typeof window.showScreen === 'function') window.showScreen('plugin-rig_builder');
+            });
+        }
 
         // Wire up select changes
         panel.querySelectorAll('select[data-tone]').forEach(sel => {
@@ -2972,25 +3376,39 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
     }
 
-    // Hook playSong for tone switching setup. Keep the wrapper singleton-style so
-    // renderer rehydration updates this implementation without stacking wrappers.
-    hookState.toneSetupImpl = async function(filename, arrangement, nextPlaySong) {
-        if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
-        stopToneMonitor();
-        closeTonePanel();
-        await nextPlaySong.call(this, filename, arrangement);
-        // Inject tones button into player controls
-        setTimeout(() => injectPlayerToneButton(), 500);
-        // Tone-chain preload is handled only by the outer playSong timer (single path — avoids
-        // stacking the menu chain with a second preload).
+    // Playback lifecycle setup. Prefer playback:loading when available so tone
+    // setup follows the redaction-safe playback domain instead of raw song ids.
+    hookState.toneSetupLifecycle = {
+        onLoading() {
+            if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
+            stopToneMonitor();
+            closeTonePanel();
+        },
+        onReady() {
+            setTimeout(() => injectPlayerToneButton(), 500);
+        },
     };
-    if (typeof window.playSong === 'function' && !hookState.toneSetupInstalled) {
-        hookState.toneSetupBasePlaySong = window.playSong;
-        window.playSong = async function(filename, arrangement) {
-            return hookState.toneSetupImpl.call(this, filename, arrangement, hookState.toneSetupBasePlaySong);
-        };
-        hookState.toneSetupInstalled = true;
+    function installToneSetupLifecycle() {
+        if (hookState.toneSetupLifecycleInstalled || !window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        hookState.toneSetupLifecycleInstalled = true;
+        if (window.slopsmith.playback && typeof window.slopsmith.playback.registerObserver === 'function') {
+            window.slopsmith.playback.registerObserver({
+                observerId: 'audio_engine.tone-setup',
+                kind: 'plugin',
+                observes: ['loading', 'ready'],
+                status: 'available',
+            });
+        }
+        if (window.slopsmith.playback && window.slopsmith.playback.version === 1) {
+            window.slopsmith.on('playback:loading', () => hookState.toneSetupLifecycle?.onLoading?.());
+            window.slopsmith.on('playback:ready', () => hookState.toneSetupLifecycle?.onReady?.());
+        } else {
+            window.slopsmith.on('song:loading', () => hookState.toneSetupLifecycle?.onLoading?.());
+            window.slopsmith.on('song:loaded', () => hookState.toneSetupLifecycle?.onReady?.());
+            window.slopsmith.on('song:ready', () => hookState.toneSetupLifecycle?.onReady?.());
+        }
     }
+    installToneSetupLifecycle();
 
     // ── Tone Automation ────────────────────────────────────────────────────────
     /** Default keyword dictionaries for the Auto Classifier Filters. Each
@@ -3183,8 +3601,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
     }
 
-    /** Applies the appropriate target preset to a free-form input string (song
-     *  filename, tone name, or manual user text). When `force` is set, ignores
+    /** Applies the appropriate target preset to a free-form input string (safe
+     *  playback song key, tone name, or manual user text). When `force` is set, ignores
      *  the enabled toggle so the modal's "Apply" button can still trigger. */
     async function applyToneAutomationFor(input, options = {}) {
         const cfg = readTaStore();
@@ -3197,14 +3615,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
 
     /** Installs a TA-driven `_toneSwitcher` for the loaded song. Called from
-     *  the playSong wrapper when Tone Automation Mode is on. Picks the initial
-     *  preset from the song's base tone or falls back to the song filename. */
-    async function installTaSwitcherForSong(songFile, toneChanges, toneBase) {
+     *  playback lifecycle when Tone Automation Mode is on. Picks the initial
+     *  preset from the song's base tone or falls back to the safe song key. */
+    async function installTaSwitcherForSong(songKey, toneChanges, toneBase) {
         const cfg = readTaStore();
         if (!cfg.enabled) return false;
         const switcher = new ToneAutomationSwitcher();
         window._toneSwitcher = switcher;
-        const initialInput = String(toneBase || songFile || '').trim();
+        const initialInput = String(toneBase || songKey || '').trim();
         if (initialInput) await switcher.switchToTone(initialInput);
         return true;
     }
@@ -3362,9 +3780,6 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     // Hook registry shared across re-evaluations; see the IIFE 1 comment for
     // why we don't preemptively clear toneAutoMonitor here.
     const hookState = window.__slopsmithDesktopAudioHooks;
-    const origPS = hookState.toneAutoBasePlaySong || window.playSong;
-    if (!origPS) return;
-
     let _lastTone = null;
     // Throttle the "_toneSwitcher not ready" warning — the tone monitor polls
     // at 50ms, so without this it would log every tick while the switcher is
@@ -3375,7 +3790,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     // Reuse helpers from the audio-API IIFE — avoids duplicate implementations drifting apart.
     const normalizeSongKey = window._aeNormalizeSongKey || ((raw) => String(raw || '').replace(/\\/g, '/').trim());
-    const getCurrentSongKey = window._aeGetCurrentSongKey || (() => normalizeSongKey(window._currentSongFile || window._slopsmithSongKey || ''));
+    const getCurrentSongKey = window._aeGetCurrentSongKey || (() => normalizeSongKey(window._slopsmithPlaybackSettingsKey || window._currentSongFile || window._slopsmithSongKey || ''));
     const getToneChangeTime = window._aeGetToneChangeTime || ((tc) => { const t = tc?.t ?? tc?.time ?? tc?.timestamp ?? tc?.at; return Number.isFinite(t) ? t : Infinity; });
 
     function getTonePreloadCacheKey() {
@@ -3469,6 +3884,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     async function resolveChainRebuildGuard() {
         const api = window.slopsmithDesktop?.audio;
         if (!api) return;
+        const providerRoute = window._aeInspectProviderManagedChain && window._aeInspectProviderManagedChain();
+        if (providerRoute) {
+            if (['selected', 'resolving', 'loading', 'fallback'].includes(providerRoute.state)) return;
+            aeSetMonitorMuteSuppressed(false);
+            return;
+        }
         let slots = [];
         try { slots = await api.getChainState(); } catch (_) { slots = []; }
         if (Array.isArray(slots) && slots.length > 0) {
@@ -3572,33 +3993,49 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }, 50);
     }
 
-    hookState.toneAutoImpl = async function(filename, arrangement, nextPlaySong) {
-        if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
-        if (hookState.toneAutoMonitor) { clearInterval(hookState.toneAutoMonitor); hookState.toneAutoMonitor = null; }
-        window._toneAutoSwitchActive = false;
-        window._aeDidClearChainForNewSong = false;
-        window._aeClearingChainForNewSong = false;
-        _lastTone = null;
-        _toneSwitcherWarned = false;
-        window._aeTaSessionOverrides = {};
-        if (window._closeChainPanel) window._closeChainPanel();
-        window._currentSongFile = decodeURIComponent(filename);
-        window._slopsmithSongKey = normalizeSongKey(window._currentSongFile);
-        // Reset preload tracking when the song file changes (not when only arrangement/track changes)
-        const skNow = getCurrentSongKey();
-        if (_preloadedToneCacheKey) {
-            const cachedSongKey = _preloadedToneCacheKey.split('::')[0];
-            if (cachedSongKey !== skNow) {
-                _preloadedToneCacheKey = null;
-                window._toneSwitcher = null;
+    hookState.toneAutoLifecycle = {
+        prepare(songRef) {
+            const detail = songRef && typeof songRef === 'object' ? songRef : { filename: songRef };
+            const target = detail.target && typeof detail.target === 'object' ? detail.target : {};
+            const settingsKey = normalizeSongKey(target.settingsKey || detail.settingsKey || '');
+            const legacyFilename = detail.filename != null ? decodeURIComponent(detail.filename || '') : '';
+            if (window._aeMarkSongTransition) window._aeMarkSongTransition(7000);
+            if (hookState.toneAutoMonitor) { clearInterval(hookState.toneAutoMonitor); hookState.toneAutoMonitor = null; }
+            window._toneAutoSwitchActive = false;
+            window._aeDidClearChainForNewSong = false;
+            window._aeClearingChainForNewSong = false;
+            _lastTone = null;
+            _toneSwitcherWarned = false;
+            window._aeTaSessionOverrides = {};
+            if (window._closeChainPanel) window._closeChainPanel();
+            window._slopsmithPlaybackSettingsKey = settingsKey;
+            window._currentSongFile = legacyFilename;
+            window._slopsmithSongKey = settingsKey || normalizeSongKey(legacyFilename);
+            if (settingsKey && legacyFilename && window._aeMigrateToneMappingsToPlaybackSettingsKey) {
+                window._aeMigrateToneMappingsToPlaybackSettingsKey(settingsKey, legacyFilename);
             }
-        }
+            hookState.toneAutoLoadGeneration = (hookState.toneAutoLoadGeneration || 0) + 1;
+            hookState.toneAutoReadyGeneration = 0;
+            // Reset preload tracking when the song file changes (not when only arrangement/track changes)
+            const skNow = getCurrentSongKey();
+            if (_preloadedToneCacheKey) {
+                const cachedSongKey = _preloadedToneCacheKey.split('::')[0];
+                if (cachedSongKey !== skNow) {
+                    _preloadedToneCacheKey = null;
+                    window._toneSwitcher = null;
+                }
+            }
+        },
 
-        await nextPlaySong.call(this, filename, arrangement);
+        ready() {
+            const generation = hookState.toneAutoLoadGeneration || 0;
+            if (!generation || hookState.toneAutoReadyGeneration === generation) return;
+            hookState.toneAutoReadyGeneration = generation;
 
-        // Tear down the menu/default chain after load (never await clearChain here — it can re-enter
-        // the audio host during playSong and crash). The timed preload below rebuilds song presets.
-        setTimeout(() => {
+            // Tear down the menu/default chain after load (never await clearChain here — it can re-enter
+            // the audio host during startup and crash). The timed preload below rebuilds song presets.
+            setTimeout(() => {
+            if (hookState.toneAutoLoadGeneration !== generation) return;
             if (window._aeClearChainForNewSong) {
                 window._aeClearingChainForNewSong = true;
                 void window._aeClearChainForNewSong().then((cleared) => {
@@ -3617,30 +4054,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
         // Inject Chain button
         setTimeout(() => {
-            const controls = document.getElementById('player-controls');
-            if (!controls || document.getElementById('btn-chain-switch')) return;
-            const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
-            if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
-                closeBtn.addEventListener('click', () => {
-                    if (window._closeChainPanel) window._closeChainPanel();
-                    if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
-                }, { capture: true });
-                closeBtn.dataset.chainPanelCloseBound = '1';
-            }
-            const btn = document.createElement('button');
-            btn.id = 'btn-chain-switch';
-            btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
-            btn.textContent = 'Chain';
-            btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
-            if (closeBtn) controls.insertBefore(btn, closeBtn);
-            else controls.appendChild(btn);
+            if (hookState.toneAutoLoadGeneration !== generation) return;
+            if (window._aeInjectPlayerToneButton) window._aeInjectPlayerToneButton();
         }, 500);
 
         // Start tone monitoring and preload presets after WebSocket delivers tone data
         setTimeout(async () => {
-            // Re-assert monitor-mute suppression: this preload re-clears the
-            // chain, and clearChainForNewSong may have been skipped.
-            if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
+            if (hookState.toneAutoLoadGeneration !== generation) return;
+            let shouldResolveChainRebuildGuard = false;
             try {
             // Only start the 50ms polling interval when at least one switching mode is on;
             // starting it unconditionally wastes cycles on localStorage + highway reads every
@@ -3658,6 +4079,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             const api = window.slopsmithDesktop?.audio;
             const hw = window.highway || window._slopsmithHighway;
             if (!api || !hw) return;
+
+            if (window._aeHasProviderManagedChain && window._aeHasProviderManagedChain()) {
+                window._toneSwitcher = null;
+                if (window._aeStopToneMonitor) window._aeStopToneMonitor();
+                _preloadedToneCacheKey = null;
+                console.log('[tone-switcher] Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload');
+                return;
+            }
 
             const songKeyPreflight = getCurrentSongKey();
             let midiPreflight = null;
@@ -3718,9 +4147,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             // processors onto the preserved hand-built chain. The genuine
             // skip reasons (already-cleared / clearing-in-flight) only occur
             // with songNeedsRebuild true.
-            let chainClearedForLoad = skipPreflightClear && songNeedsRebuild;
+            const skippedBecauseExistingClear = songNeedsRebuild
+                && (!!window._aeDidClearChainForNewSong || !!window._aeClearingChainForNewSong);
+            shouldResolveChainRebuildGuard = skippedBecauseExistingClear;
+            let chainClearedForLoad = skippedBecauseExistingClear;
             if (!skipPreflightClear) {
                 try {
+                    shouldResolveChainRebuildGuard = true;
+                    if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
                     await api.clearChain();
                     chainClearedForLoad = true;
                     try {
@@ -3792,12 +4226,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             // monitor above invokes it on every tone change.
             if (window._aeToneAutomation?.isEnabled?.()) {
                 const installed = await window._aeToneAutomation.installSwitcherForSong(
-                    window._currentSongFile || filename, toneChanges, toneBase
+                    getCurrentSongKey(), toneChanges, toneBase
                 );
                 if (installed) {
                     _preloadedToneCacheKey = getTonePreloadCacheKey();
                     startToneAutoSwitch();
-                    console.log('[tone-automation] installed for song:', window._currentSongFile || filename);
+                    console.log('[tone-automation] installed for song:', getCurrentSongKey());
                     return;
                 }
             }
@@ -3889,6 +4323,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 }
 
                 if (!chainClearedForLoad) {
+                    shouldResolveChainRebuildGuard = true;
+                    if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
                     await api.clearChain();
                     chainClearedForLoad = true;
                 }
@@ -3991,62 +4427,69 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             } catch (err) {
                 console.error('[tone-switcher] Preload failed:', err);
             } finally {
-                // Resolve the rebuild guard on every exit path (early returns,
-                // success, or a thrown rebuild) so the monitor-mute state
-                // always matches the chain that actually ended up loaded.
-                await resolveChainRebuildGuard();
+                // Resolve only when this path actually started or inherited a
+                // rebuild guard; skipped provider/no-rebuild paths should not
+                // show an empty-chain monitor warning.
+                if (shouldResolveChainRebuildGuard) await resolveChainRebuildGuard();
             }
         }, 800);
+        },
     };
 
-    if (!hookState.toneAutoInstalled) {
-        hookState.toneAutoBasePlaySong = origPS;
-        window.playSong = async function(filename, arrangement) {
-            return hookState.toneAutoImpl.call(this, filename, arrangement, hookState.toneAutoBasePlaySong);
-        };
-        hookState.toneAutoInstalled = true;
+    function playbackEventPayload(event) {
+        const detail = event && event.detail || {};
+        return detail.payload || detail;
     }
 
-    hookState.stopSongImpl = async function(args, nextStopSong) {
-        // Tear down both monitors (IIFE 1's toneMonitorInterval + IIFE 2's
-        // toneAutoMonitor) — leaving either running after stopSong would keep
-        // polling/switching tones on a stopped song until the next playSong.
-        if (window._aeStopToneMonitor) window._aeStopToneMonitor();
-        try {
-            return await nextStopSong.apply(this, args);
-        } finally {
+    function installToneAutoLifecycle() {
+        if (hookState.toneAutoLifecycleInstalled || !window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        hookState.toneAutoLifecycleInstalled = true;
+        if (window.slopsmith.playback && typeof window.slopsmith.playback.registerObserver === 'function') {
+            window.slopsmith.playback.registerObserver({
+                observerId: 'audio_engine.tone-automation',
+                kind: 'plugin',
+                observes: ['loading', 'ready', 'stopped', 'ended'],
+                status: 'available',
+            });
+        }
+        const onLoading = (event) => hookState.toneAutoLifecycle?.prepare?.(playbackEventPayload(event));
+        const onReady = () => hookState.toneAutoLifecycle?.ready?.();
+        if (window.slopsmith.playback && window.slopsmith.playback.version === 1) {
+            window.slopsmith.on('playback:loading', onLoading);
+            window.slopsmith.on('playback:ready', onReady);
+        } else {
+            window.slopsmith.on('song:loading', onLoading);
+            window.slopsmith.on('song:loaded', onReady);
+            window.slopsmith.on('song:ready', onReady);
+        }
+        const onFinished = () => {
+            if (window._aeStopToneMonitor) window._aeStopToneMonitor();
             if (window._closeChainPanel) window._closeChainPanel();
             if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('song-stop');
-        }
-    };
-    if (typeof window.stopSong === 'function' && !hookState.stopSongInstalled) {
-        hookState.stopSongBaseStopSong = window.stopSong;
-        window.stopSong = async function(...args) {
-            return hookState.stopSongImpl.call(this, args, hookState.stopSongBaseStopSong);
         };
-        hookState.stopSongInstalled = true;
-    }
-
-    // Inject Chain button immediately at startup so it's always visible in the
-    // player controls — don't wait for the first song play.
-    function tryInjectChainButton() {
-        const controls = document.getElementById('player-controls');
-        if (!controls || document.getElementById('btn-chain-switch')) return;
-        const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
-        if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
-            closeBtn.addEventListener('click', () => {
-                if (window._closeChainPanel) window._closeChainPanel();
-                if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
-            }, { capture: true });
-            closeBtn.dataset.chainPanelCloseBound = '1';
+        if (window.slopsmith.playback && window.slopsmith.playback.version === 1) {
+            window.slopsmith.on('playback:stopped', onFinished);
+            window.slopsmith.on('playback:ended', onFinished);
+        } else {
+            window.slopsmith.on('song:stop', onFinished);
+            window.slopsmith.on('song:ended', onFinished);
         }
-        const btn = document.createElement('button');
-        btn.id = 'btn-chain-switch';
-        btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
-        btn.textContent = 'Chain';
-        btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
-        if (closeBtn) controls.insertBefore(btn, closeBtn);
-        else controls.appendChild(btn);
+    }
+    installToneAutoLifecycle();
+
+    // Re-run the shared Chain button owner check after startup and route changes.
+    function tryInjectChainButton() {
+        if (window._aeInjectPlayerToneButton) window._aeInjectPlayerToneButton();
+    }
+    function refreshChainButtonForRouteOwner() {
+        setTimeout(tryInjectChainButton, 0);
+    }
+    window.addEventListener('rig-builder:tones-state', refreshChainButtonForRouteOwner);
+    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        window.slopsmith.on('audio-effects:route-selected', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:changed', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:released', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:fallback', refreshChainButtonForRouteOwner);
     }
     // Allow app.js to finish initialising before querying the DOM.
     setTimeout(tryInjectChainButton, 0);

@@ -1,5 +1,5 @@
 #include "NoteVerifier.h"
-#include "AudioEngine.h"
+#include "InputRingReader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,8 +44,8 @@ struct NoteVerifier::Worker : public juce::Thread
 };
 
 // ── NoteVerifier ─────────────────────────────────────────────────────────────
-NoteVerifier::NoteVerifier(AudioEngine& ownerEngine)
-    : engine(ownerEngine) {}
+NoteVerifier::NoteVerifier(InputRingReader& ringReader)
+    : engine(ringReader) {}
 
 NoteVerifier::~NoteVerifier() { stop(); }
 
@@ -104,7 +104,8 @@ void NoteVerifier::setPlayhead(double songTime, bool playing)
         // currentPlayhead() can never read a half-updated set.
         const juce::ScopedLock sl(lock);
         pushedReceiptMs = juce::Time::getMillisecondCounterHiRes();
-        pushedSongTime = songTime;
+        // Shift by this source's capture-latency correction (0 on the primary).
+        pushedSongTime = songTime - playheadOffsetSec.load(std::memory_order_relaxed);
         pushedPlaying = playing;
     }
     havePushedPlayhead.store(true);
